@@ -1,0 +1,22 @@
+# build artifacts
+/build/
+/dist/
+*.exe
+*.dll
+*.a
+*.obj
+*.o
+*.pdb
+*.zip
+
+# secrets / runtime state — НЕ коммитить (пароли в открытом виде)
+config.json
+cameras.json
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
