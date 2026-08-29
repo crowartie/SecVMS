@@ -214,12 +214,13 @@ bool Decoder::openAndDecode() {
                         // все кадры показываются с задержкой buffer, что гасит сетевой джиттер.
                         long long nowUs = av_gettime();
                         long long bufUs = bufferUs_.load();
+                        const double spd = qMax(0.25, speed_.load());   // ускоренный архив
                         int64_t bpts = frm->best_effort_timestamp;
                         long long targetUs;
                         if (bpts != AV_NOPTS_VALUE) {
                             long long ptsUs = (long long)(bpts * av_q2d(tb) * 1000000.0);
                             if (firstPtsUs < 0) { firstPtsUs = ptsUs; startWallUs = nowUs + bufUs; }
-                            targetUs = startWallUs + (ptsUs - firstPtsUs);
+                            targetUs = startWallUs + (long long)((ptsUs - firstPtsUs) / spd);
                             long long drift = targetUs - nowUs;
                             // «убежали вперёд» разрешаем на величину буфера (+запас), назад — 300мс
                             if (drift > bufUs + 700000 || drift < -300000) {   // скачок PTS / отстали — ресинхрон

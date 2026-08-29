@@ -6,17 +6,22 @@
 #include <QDateEdit>
 #include <QLabel>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QPainter>
 #include <QMouseEvent>
+#include <QFileDialog>
+#include <QMessageBox>
+#include <QStandardPaths>
 #include <QUrl>
 #include <QtConcurrent>
 #include <QFutureWatcher>
 
 // ---------------------------------------------------------------- таймлайн
 
-// 24-часовая шкала: зоны записи + курсор; клик/протяжка = переход.
+// 24-часовая шкала: зоны записи + курсор + выделенный интервал.
+// Обычный клик/протяжка = переход; Shift+клик = отметить начало/конец интервала.
 class TimelineBar : public QWidget {
     Q_OBJECT
 public:
@@ -27,8 +32,10 @@ public:
     void setDay(const QDate& d)                  { day_ = d; update(); }
     void setSegments(const QVector<ArchSeg>& s)  { segs_ = s; update(); }
     void setCursorTime(const QDateTime& t)       { cur_ = t; update(); }
+    void setSelection(const QDateTime& a, const QDateTime& b) { selA_ = a; selB_ = b; update(); }
 signals:
     void seekRequested(const QDateTime& t);
+    void selectRequested(const QDateTime& t);
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
@@ -37,19 +44,27 @@ protected:
         p.fillRect(bar, Theme::dark ? QColor("#14171b") : QColor("#ffffff"));
         p.setPen(Theme::dark ? QColor("#333a42") : QColor("#c9cfd7"));
         p.drawRect(bar.adjusted(0, 0, -1, -1));
-        // зоны записи
-        if (day_.isValid()) {
-            const QDateTime d0(day_, QTime(0, 0, 0));
+        auto xOf = [&](const QDateTime& t){
+            const double a = qBound<qint64>(qint64(0), QDateTime(day_,QTime(0,0,0)).secsTo(t),
+                                            qint64(86400)) / 86400.0;
+            return bar.x() + int(a * bar.width());
+        };
+        if (day_.isValid())
             for (const auto& s : segs_) {
-                const double a = qBound<qint64>(qint64(0), d0.secsTo(s.b), qint64(86400)) / 86400.0;
-                const double b = qBound<qint64>(qint64(0), d0.secsTo(s.e), qint64(86400)) / 86400.0;
-                const int x0 = bar.x() + int(a * bar.width());
-                const int x1 = bar.x() + qMax(int(b * bar.width()), x0 + 1);
+                const int x0 = xOf(s.b), x1 = qMax(xOf(s.e), x0 + 1);
                 p.fillRect(QRect(QPoint(x0, bar.y() + 1), QPoint(x1, bar.bottom() - 1)),
                            QColor("#3ca35a"));
             }
+        // выделенный для скачивания интервал
+        if (selA_.isValid() && selB_.isValid() && day_.isValid()) {
+            int x0 = xOf(selA_ < selB_ ? selA_ : selB_);
+            int x1 = xOf(selA_ < selB_ ? selB_ : selA_);
+            p.fillRect(QRect(QPoint(x0, bar.y()), QPoint(qMax(x1, x0+1), bar.bottom())),
+                       QColor(31, 111, 214, 90));
+            p.setPen(QColor("#1f6fd6"));
+            p.drawLine(x0, bar.y(), x0, bar.bottom());
+            p.drawLine(x1, bar.y(), x1, bar.bottom());
         }
-        // часовые деления + подписи каждые 3 часа
         QFont f = font(); f.setPixelSize(10); p.setFont(f);
         for (int h = 0; h <= 24; ++h) {
             const int x = bar.x() + int(bar.width() * h / 24.0);
@@ -62,28 +77,28 @@ protected:
                            QString("%1:00").arg(h, 2, 10, QChar('0')));
             }
         }
-        // курсор
         if (cur_.isValid() && day_.isValid() && cur_.date() == day_) {
-            const double a = QDateTime(day_, QTime(0,0,0)).secsTo(cur_) / 86400.0;
-            const int x = bar.x() + int(a * bar.width());
+            const int x = xOf(cur_);
             p.setPen(QPen(QColor("#e2574c"), 2));
             p.drawLine(x, bar.y() - 3, x, bar.bottom() + 3);
         }
     }
-    void mousePressEvent(QMouseEvent* e) override { emitSeek(e->position().x()); }
+    void mousePressEvent(QMouseEvent* e) override { emitAt(e); }
     void mouseMoveEvent(QMouseEvent* e) override {
-        if (e->buttons() & Qt::LeftButton) emitSeek(e->position().x());
+        if (e->buttons() & Qt::LeftButton) emitAt(e);
     }
 private:
-    void emitSeek(double px) {
+    void emitAt(QMouseEvent* e) {
         if (!day_.isValid()) return;
         const QRect bar(8, 8, width() - 16, 26);
-        const double frac = qBound(0.0, (px - bar.x()) / (double)bar.width(), 1.0);
-        emit seekRequested(QDateTime(day_, QTime(0, 0, 0)).addSecs(qint64(frac * 86400)));
+        const double frac = qBound(0.0, (e->position().x() - bar.x()) / (double)bar.width(), 1.0);
+        const QDateTime t = QDateTime(day_, QTime(0, 0, 0)).addSecs(qint64(frac * 86400));
+        if (e->modifiers() & Qt::ShiftModifier) emit selectRequested(t);
+        else                                    emit seekRequested(t);
     }
     QDate day_;
     QVector<ArchSeg> segs_;
-    QDateTime cur_;
+    QDateTime cur_, selA_, selB_;
 };
 
 // ---------------------------------------------------------------- экран
@@ -118,7 +133,7 @@ private:
 
 PlaybackView::PlaybackView(QWidget* parent) : QWidget(parent) { buildUi(); }
 
-PlaybackView::~PlaybackView() { stopStream(); }
+PlaybackView::~PlaybackView() { stopStream(); if (dl_) dl_->cancel(); }
 
 void PlaybackView::buildUi() {
     auto* v = new QVBoxLayout(this);
@@ -127,11 +142,16 @@ void PlaybackView::buildUi() {
 
     auto* top = new QHBoxLayout; top->setSpacing(8);
     top->addWidget(new QLabel(QStringLiteral("Регистратор:")));
-    devCb_ = new QComboBox; devCb_->setMinimumWidth(190);
+    devCb_ = new QComboBox; devCb_->setMinimumWidth(180);
     top->addWidget(devCb_);
     top->addWidget(new QLabel(QStringLiteral("Камера:")));
-    camCb_ = new QComboBox; camCb_->setMinimumWidth(150);
+    camCb_ = new QComboBox; camCb_->setMinimumWidth(140);
     top->addWidget(camCb_);
+    streamCb_ = new QComboBox;
+    streamCb_->addItem(QStringLiteral("Осн. поток"), 0);
+    streamCb_->addItem(QStringLiteral("Субпоток"),   1);
+    streamCb_->setToolTip(QStringLiteral("Субпоток меньше грузит сеть и регистратор"));
+    top->addWidget(streamCb_);
     top->addWidget(new QLabel(QStringLiteral("Дата:")));
     dateEd_ = new QDateEdit(QDate::currentDate());
     dateEd_->setCalendarPopup(true);
@@ -150,19 +170,41 @@ void PlaybackView::buildUi() {
     tl_ = new TimelineBar;
     v->addWidget(tl_);
 
-    auto* bot = new QHBoxLayout; bot->setSpacing(10);
+    auto* bot = new QHBoxLayout; bot->setSpacing(8);
     playBtn_ = new QPushButton(QStringLiteral("▶"));
-    playBtn_->setObjectName("tool");
-    playBtn_->setFixedWidth(44);
+    playBtn_->setObjectName("tool"); playBtn_->setFixedWidth(44);
     playBtn_->setToolTip(QStringLiteral("Воспроизведение / пауза"));
     bot->addWidget(playBtn_);
-    timeLbl_ = new QLabel(QStringLiteral("—"));
+    timeLbl_ = new QLabel(QStringLiteral("—")); timeLbl_->setMinimumWidth(150);
     bot->addWidget(timeLbl_);
+    bot->addSpacing(6);
+    // скорость
+    for (double sp : { 1.0, 2.0, 4.0, 8.0 }) {
+        auto* b = new QPushButton(QString("x%1").arg(sp, 0, 'g', 2));
+        b->setObjectName("tool"); b->setCheckable(true); b->setFixedWidth(38);
+        b->setProperty("spd", sp);
+        connect(b, &QPushButton::clicked, this, [this, sp]{ speed_ = sp; applySpeed();
+            for (auto* x : speedBtns_) x->setChecked(x->property("spd").toDouble() == sp); });
+        speedBtns_ << b;
+        bot->addWidget(b);
+    }
+    speedBtns_.first()->setChecked(true);
     bot->addStretch();
+    // выделение + скачивание
+    selLbl_ = new QLabel(QStringLiteral("Интервал: Shift+клик по шкале (начало и конец)"));
+    selLbl_->setObjectName("fieldLbl");
+    bot->addWidget(selLbl_);
+    dlBar_ = new QProgressBar; dlBar_->setFixedWidth(140); dlBar_->setVisible(false);
+    bot->addWidget(dlBar_);
+    dlCancel_ = new QPushButton(QStringLiteral("Отмена")); dlCancel_->setObjectName("ghost");
+    dlCancel_->setVisible(false);
+    bot->addWidget(dlCancel_);
+    dlBtn_ = new QPushButton(QStringLiteral("Скачать интервал")); dlBtn_->setObjectName("tool");
+    dlBtn_->setEnabled(false);
+    bot->addWidget(dlBtn_);
     v->addLayout(bot);
 
     connect(devCb_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){
-        // камеры выбранного регистратора
         camCb_->clear();
         if (const Device* d = curDevice())
             for (const auto& c : d->cams)
@@ -173,15 +215,38 @@ void PlaybackView::buildUi() {
     connect(tl_, &TimelineBar::seekRequested, this, [this](const QDateTime& t){
         if (!segs_.isEmpty()) seekTo(t, true);
     });
+    connect(tl_, &TimelineBar::selectRequested, this, [this](const QDateTime& t){
+        // Shift-клики задают начало и конец интервала (третий клик начинает заново)
+        if (!selStart_.isValid() || (selStart_.isValid() && selEnd_.isValid())) {
+            selStart_ = t; selEnd_ = QDateTime();
+        } else {
+            selEnd_ = t;
+        }
+        tl_->setSelection(selStart_, selEnd_);
+        const bool ready = selStart_.isValid() && selEnd_.isValid() && selStart_ != selEnd_;
+        dlBtn_->setEnabled(ready && !dl_);
+        if (ready) {
+            QDateTime a = qMin(selStart_, selEnd_), b = qMax(selStart_, selEnd_);
+            selLbl_->setText(QStringLiteral("Интервал: %1 – %2")
+                                 .arg(a.toString("HH:mm:ss"), b.toString("HH:mm:ss")));
+        } else selLbl_->setText(QStringLiteral("Интервал: отметьте конец (Shift+клик)"));
+    });
     connect(playBtn_, &QPushButton::clicked, this, [this]{
-        if (playing_) {                      // пауза: остановить поток, курсор остаётся
-            stopStream();
-            playing_ = false;
+        if (playing_ && !paused_) {                 // пауза
+            paused_ = true;
+            if (xm_) xm_->setPaused(true);
+            else stopStream();                        // Dahua: пауза = стоп потока
             playBtn_->setText(QStringLiteral("▶"));
+        } else if (playing_ && paused_) {           // продолжить
+            paused_ = false;
+            if (xm_) { xm_->setPaused(false); playBtn_->setText(QStringLiteral("⏸")); }
+            else seekTo(cursor_.isValid() ? cursor_ : segs_.first().b, true);
         } else if (!segs_.isEmpty()) {
             seekTo(cursor_.isValid() ? cursor_ : segs_.first().b, true);
         }
     });
+    connect(dlBtn_, &QPushButton::clicked, this, [this]{ startDownload(); });
+    connect(dlCancel_, &QPushButton::clicked, this, [this]{ if (dl_) dl_->cancel(); });
 }
 
 void PlaybackView::setDevices(const QVector<Device>& devs) {
@@ -193,7 +258,6 @@ void PlaybackView::setDevices(const QVector<Device>& devs) {
         devCb_->addItem(d.name.isEmpty() ? d.ip : d.name, d.ip);
     int i = devCb_->findData(keep);
     devCb_->setCurrentIndex(i < 0 ? 0 : i);
-    // перезаполнить камеры вручную (сигнал заблокирован)
     camCb_->clear();
     if (const Device* d = curDevice())
         for (const auto& c : d->cams)
@@ -206,10 +270,8 @@ const Device* PlaybackView::curDevice() const {
     for (const auto& d : devs_) if (d.ip == ip) return &d;
     return nullptr;
 }
-
-int PlaybackView::curChannel() const {
-    return camCb_->currentData().toInt();
-}
+int PlaybackView::curChannel() const { return camCb_->currentData().toInt(); }
+int PlaybackView::curStream()  const { return streamCb_->currentData().toInt(); }
 
 void PlaybackView::stopStream() {
     if (xm_) { xm_->stopAndWait(); xm_->deleteLater(); xm_ = nullptr; }
@@ -218,13 +280,18 @@ void PlaybackView::stopStream() {
 
 void PlaybackView::stopPlayback() {
     stopStream();
-    playing_ = false;
+    playing_ = false; paused_ = false;
     if (playBtn_) playBtn_->setText(QStringLiteral("▶"));
+}
+
+void PlaybackView::applySpeed() {
+    if (xm_) xm_->setSpeed(speed_);
+    if (dh_) dh_->setSpeed(speed_);
 }
 
 void PlaybackView::loadSegments() {
     const Device* d = curDevice();
-    if (!d || curChannel() <= 0 || loading_) return;
+    if (!d || curChannel() <= 0 || loading_ || dl_) return;
     if (d->proto == "tvt") {
         status_->setText(QStringLiteral("Архив TVT/ONVIF пока не поддерживается"));
         segs_.clear(); tl_->setSegments({});
@@ -237,9 +304,11 @@ void PlaybackView::loadSegments() {
     status_->setText(QStringLiteral("Запрос списка записей..."));
     day_ = dateEd_->date();
     tl_->setDay(day_);
+    selStart_ = selEnd_ = QDateTime(); tl_->setSelection({}, {}); dlBtn_->setEnabled(false);
 
     const Device dev = *d;
     const int ch = curChannel();
+    const int st = curStream();
     const QDate day = day_;
     auto* w = new QFutureWatcher<QVector<ArchSeg>>(this);
     connect(w, &QFutureWatcher<QVector<ArchSeg>>::finished, this, [this, w]{
@@ -256,22 +325,18 @@ void PlaybackView::loadSegments() {
         qint64 totalSec = 0;
         for (const auto& s : segs_) totalSec += s.b.secsTo(s.e);
         status_->setText(QStringLiteral("Фрагментов: %1, записано: %2 ч %3 мин")
-                             .arg(segs_.size())
-                             .arg(totalSec / 3600).arg((totalSec % 3600) / 60));
-        seekTo(segs_.first().b, true);   // сразу играть с первой записи дня
+                             .arg(segs_.size()).arg(totalSec / 3600).arg((totalSec % 3600) / 60));
+        seekTo(segs_.first().b, true);
     });
-    w->setFuture(QtConcurrent::run([dev, ch, day]{
+    w->setFuture(QtConcurrent::run([dev, ch, day, st]{
         QString err;
-        QVector<ArchSeg> out = (dev.proto == "dahua")
-            ? dahuaQuerySegments(dev, ch, day, &err)
-            : xmQuerySegments(dev, ch, day, &err);
-        return out;
+        return (dev.proto == "dahua") ? dahuaQuerySegments(dev, ch, day, &err)
+                                      : xmQuerySegments(dev, ch, day, &err, st);
     }));
 }
 
 void PlaybackView::seekTo(QDateTime t, bool autoplay) {
     if (segs_.isEmpty()) return;
-    // внутри дыры — прыжок к началу следующей записи; после последней — к последней
     seekSegIdx_ = -1;
     for (int i = 0; i < segs_.size(); ++i) {
         if (t < segs_[i].b)                       { t = segs_[i].b; seekSegIdx_ = i; break; }
@@ -280,8 +345,8 @@ void PlaybackView::seekTo(QDateTime t, bool autoplay) {
     if (seekSegIdx_ < 0) { seekSegIdx_ = segs_.size() - 1; t = segs_.last().b; }
 
     stopStream();
-    cursor_ = t;
-    seekBase_ = t;
+    cursor_ = t; seekBase_ = t;
+    paused_ = false;
     tl_->setCursorTime(t);
     updateTimeLabel();
     if (!autoplay) return;
@@ -294,27 +359,24 @@ void PlaybackView::seekTo(QDateTime t, bool autoplay) {
     status_->clear();
 
     if (d->proto == "dahua") {
-        // Dahua: RTSP playback — регистратор сам играет через все файлы до конца суток
         const QString u = QString::fromLatin1(QUrl::toPercentEncoding(d->user));
         const QString p = QString::fromLatin1(QUrl::toPercentEncoding(d->pass));
-        const QString url = QString("rtsp://%1:%2@%3:%4/cam/playback?channel=%5"
-                                    "&starttime=%6&endtime=%7")
-            .arg(u, p, d->ip).arg(d->rtspPort).arg(curChannel())
+        const QString url = QString("rtsp://%1:%2@%3:%4/cam/playback?channel=%5&subtype=%6"
+                                    "&starttime=%7&endtime=%8")
+            .arg(u, p, d->ip).arg(d->rtspPort).arg(curChannel()).arg(curStream())
             .arg(t.toString("yyyy_MM_dd_HH_mm_ss"), dayEnd.toString("yyyy_MM_dd_HH_mm_ss"));
         dh_ = new Decoder(this);
         dh_->setOneShot(true);
-        dh_->setBuffer(200);
+        dh_->setBuffer(150);
+        dh_->setSpeed(speed_);
         dh_->setTarget(screen_->width(), screen_->height());
         connect(dh_, &Decoder::frame, this, [this](const QImage& img){ screen_->setImage(img); },
                 Qt::QueuedConnection);
         connect(dh_, &Decoder::progress, this, [this](double sec){
-            cursor_ = mapElapsed(sec);
-            tl_->setCursorTime(cursor_);
-            updateTimeLabel();
+            cursor_ = mapElapsed(sec); tl_->setCursorTime(cursor_); updateTimeLabel();
         }, Qt::QueuedConnection);
         connect(dh_, &Decoder::eof, this, [this]{
-            playing_ = false;
-            playBtn_->setText(QStringLiteral("▶"));
+            playing_ = false; playBtn_->setText(QStringLiteral("▶"));
             status_->setText(QStringLiteral("Конец записей за день"));
         }, Qt::QueuedConnection);
         connect(dh_, &Decoder::openFailed, this, [this]{
@@ -322,31 +384,24 @@ void PlaybackView::seekTo(QDateTime t, bool autoplay) {
         }, Qt::QueuedConnection);
         dh_->begin(url, false, d->rtspUdp);
     } else {
-        // Xiongmai: DVRIP ByTime — регистратор «сшивает» файлы и пропускает дыры сам
         xm_ = new XmPlayThread(this);
         xm_->setTarget(screen_->width(), screen_->height());
         connect(xm_, &XmPlayThread::frame, this, &PlaybackView::onFrameTs, Qt::QueuedConnection);
         connect(xm_, &XmPlayThread::ended, this, [this]{
-            playing_ = false;
-            playBtn_->setText(QStringLiteral("▶"));
+            playing_ = false; playBtn_->setText(QStringLiteral("▶"));
             status_->setText(QStringLiteral("Конец записей за день"));
         }, Qt::QueuedConnection);
         connect(xm_, &XmPlayThread::failed, this, [this](const QString& why){
-            playing_ = false;
-            playBtn_->setText(QStringLiteral("▶"));
+            playing_ = false; playBtn_->setText(QStringLiteral("▶"));
             status_->setText(QStringLiteral("Архив: %1").arg(why));
         }, Qt::QueuedConnection);
-        xm_->begin(*d, curChannel(), t, dayEnd);
+        xm_->begin(*d, curChannel(), t, dayEnd, curStream(), speed_);
     }
 }
 
 void PlaybackView::onFrameTs(const QImage& img, const QDateTime& ts) {
     screen_->setImage(img);
-    if (ts.isValid()) {
-        cursor_ = ts;
-        tl_->setCursorTime(ts);
-        updateTimeLabel();
-    }
+    if (ts.isValid()) { cursor_ = ts; tl_->setCursorTime(ts); updateTimeLabel(); }
 }
 
 void PlaybackView::updateTimeLabel() {
@@ -355,8 +410,6 @@ void PlaybackView::updateTimeLabel() {
 }
 
 QDateTime PlaybackView::mapElapsed(double sec) const {
-    // Регистратор играет только записанные участки подряд: прошедшее время потока
-    // раскладывается по цепочке сегментов начиная с точки перехода.
     if (seekSegIdx_ < 0 || segs_.isEmpty())
         return seekBase_.addMSecs((qint64)(sec * 1000));
     double rem = sec;
@@ -369,6 +422,56 @@ QDateTime PlaybackView::mapElapsed(double sec) const {
         else return segs_[i].e;
     }
     return pos;
+}
+
+void PlaybackView::setControlsEnabled(bool on) {
+    devCb_->setEnabled(on); camCb_->setEnabled(on); streamCb_->setEnabled(on);
+    dateEd_->setEnabled(on); loadBtn_->setEnabled(on); playBtn_->setEnabled(on);
+    for (auto* b : speedBtns_) b->setEnabled(on);
+    dlBtn_->setEnabled(on && selStart_.isValid() && selEnd_.isValid());
+}
+
+void PlaybackView::startDownload() {
+    const Device* d = curDevice();
+    if (!d || !selStart_.isValid() || !selEnd_.isValid() || dl_) return;
+    QDateTime a = qMin(selStart_, selEnd_), b = qMax(selStart_, selEnd_);
+    if (a.secsTo(b) < 2) { status_->setText(QStringLiteral("Слишком короткий интервал")); return; }
+    if (a.secsTo(b) > 3 * 3600) {   // разумное ограничение — 3 часа за раз
+        if (QMessageBox::question(this, QStringLiteral("Скачивание"),
+                QStringLiteral("Интервал больше 3 часов — файл будет очень большим. Продолжить?"))
+            != QMessageBox::Yes) return;
+    }
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    const QString suggest = QString("%1/%2_%3_%4.mp4")
+        .arg(base.isEmpty() ? QDir::homePath() : base,
+             d->name.isEmpty() ? d->ip : d->name,
+             a.toString("yyyyMMdd_HHmmss"), b.toString("HHmmss"));
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Сохранить видео"),
+                                                      suggest, "MP4 (*.mp4)");
+    if (path.isEmpty()) return;
+
+    // на время скачивания останавливаем просмотр (не грузим регистратор дважды)
+    stopPlayback();
+    setControlsEnabled(false);
+    dlBar_->setValue(0); dlBar_->setVisible(true); dlCancel_->setVisible(true);
+    status_->setText(QStringLiteral("Скачивание..."));
+
+    dl_ = new ArchiveDownloader(this);
+    connect(dl_, &ArchiveDownloader::progress, this, [this](int pct){ dlBar_->setValue(pct); },
+            Qt::QueuedConnection);
+    connect(dl_, &ArchiveDownloader::done, this, [this](const QString& p){
+        dlBar_->setVisible(false); dlCancel_->setVisible(false);
+        setControlsEnabled(true);
+        dl_->deleteLater(); dl_ = nullptr;
+        status_->setText(QStringLiteral("Сохранено: %1").arg(p));
+    }, Qt::QueuedConnection);
+    connect(dl_, &ArchiveDownloader::failed, this, [this](const QString& why){
+        dlBar_->setVisible(false); dlCancel_->setVisible(false);
+        setControlsEnabled(true);
+        dl_->deleteLater(); dl_ = nullptr;
+        status_->setText(QStringLiteral("Скачивание не удалось: %1").arg(why));
+    }, Qt::QueuedConnection);
+    dl_->begin(*d, curChannel(), a, b, curStream() == 0, path);
 }
 
 void PlaybackView::resizeEvent(QResizeEvent* e) {

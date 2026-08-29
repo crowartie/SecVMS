@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QtEndian>
+#include <QFile>
+#include <QDir>
 
 QByteArray XmClient::sofiaHash(const QString& pwd) {
     QByteArray md5 = QCryptographicHash::hash(pwd.toUtf8(), QCryptographicHash::Md5);
@@ -193,19 +195,20 @@ void XmClient::logout() {
 
 // ---- архив ----
 
-QVector<QPair<QDateTime,QDateTime>> XmClient::fileQuery(int channel0, const QDateTime& from,
-                                                        const QDateTime& to) {
-    // OPFileQuery отдаёт максимум 64 файла за запрос — листаем, сдвигая BeginTime
-    QVector<QPair<QDateTime,QDateTime>> out;
+QVector<XmClient::ArcFile> XmClient::fileQuery(int channel1, const QDateTime& from,
+                                               const QDateTime& to, int stream) {
+    // OPFileQuery отдаёт максимум 64 файла за запрос — листаем, сдвигая BeginTime.
+    // Канал в запросе 0-based; имя файла кодирует канал и точный участок (для ByName).
+    QVector<ArcFile> out;
     QDateTime cursor = from;
-    for (int guard = 0; guard < 64; ++guard) {
+    for (int guard = 0; guard < 256; ++guard) {
         QJsonObject q;
         q["BeginTime"]      = cursor.toString("yyyy-MM-dd HH:mm:ss");
         q["EndTime"]        = to.toString("yyyy-MM-dd HH:mm:ss");
-        q["Channel"]        = channel0;
+        q["Channel"]        = channel1 - 1;
         q["DriverTypeMask"] = "0x0000FFFF";
         q["Event"]          = "*";
-        q["StreamType"]     = "0x00000000";
+        q["StreamType"]     = stream == 1 ? "0x00000001" : "0x00000000";
         q["Type"]           = "h264";
         QJsonObject o; o["Name"] = "OPFileQuery"; o["SessionID"] = sid_; o["OPFileQuery"] = q;
         QByteArray resp = sendRecv(1440, QJsonDocument(o).toJson(QJsonDocument::Compact), 8000);
@@ -213,34 +216,38 @@ QVector<QPair<QDateTime,QDateTime>> XmClient::fileQuery(int channel0, const QDat
         QJsonArray arr = QJsonDocument::fromJson(resp).object().value("OPFileQuery").toArray();
         if (arr.isEmpty()) break;
         QDateTime last;
+        int added = 0;
         for (const auto& v : arr) {
             QJsonObject f = v.toObject();
-            QDateTime b = QDateTime::fromString(f["BeginTime"].toString(), "yyyy-MM-dd HH:mm:ss");
-            QDateTime e = QDateTime::fromString(f["EndTime"].toString(),   "yyyy-MM-dd HH:mm:ss");
-            if (b.isValid() && e.isValid() && e > b) {
-                out.append({ b, e });
-                if (!last.isValid() || e > last) last = e;
+            ArcFile af;
+            af.b = QDateTime::fromString(f["BeginTime"].toString(), "yyyy-MM-dd HH:mm:ss");
+            af.e = QDateTime::fromString(f["EndTime"].toString(),   "yyyy-MM-dd HH:mm:ss");
+            af.name    = f["FileName"].toString();
+            af.channel = channel1;
+            af.sizeKb  = f["FileLength"].toVariant().toLongLong();
+            if (af.b.isValid() && af.e.isValid() && af.e > af.b && !af.name.isEmpty()) {
+                out.append(af); ++added;
+                if (!last.isValid() || af.e > last) last = af.e;
             }
         }
-        if (arr.size() < 64 || !last.isValid()) break;   // последняя страница
+        if (arr.size() < 64 || !last.isValid() || added == 0) break;   // последняя страница
         cursor = last.addSecs(1);
         if (cursor >= to) break;
     }
     return out;
 }
 
-bool XmClient::playClaim(int channel0, const QDateTime& from, const QDateTime& to) {
+bool XmClient::playClaimByName(const QString& file) {
     QJsonObject par;
-    par["FileName"]   = "";
-    par["PlayMode"]   = "ByTime";      // регистратор сам идёт по файлам, пропуская дыры
-    par["Channel"]    = channel0;
+    par["FileName"]   = file;
+    par["PlayMode"]   = "ByName";      // имя файла однозначно задаёт канал и участок
     par["StreamType"] = 0;
     par["TransMode"]  = "TCP";
     par["Value"]      = 0;
     QJsonObject pb;
     pb["Action"]    = "Claim";
-    pb["StartTime"] = from.toString("yyyy-MM-dd HH:mm:ss");
-    pb["EndTime"]   = to.toString("yyyy-MM-dd HH:mm:ss");
+    pb["StartTime"] = "2000-00-00 00:00:00";
+    pb["EndTime"]   = "2000-00-00 00:00:00";
     pb["Parameter"] = par;
     QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
     QByteArray resp = sendRecv(1424, QJsonDocument(o).toJson(QJsonDocument::Compact), 6000);
@@ -249,21 +256,39 @@ bool XmClient::playClaim(int channel0, const QDateTime& from, const QDateTime& t
     return ret == 100;
 }
 
-void XmClient::playStart(int channel0, const QDateTime& from, const QDateTime& to) {
+void XmClient::playStartByName(const QString& file) {
     QJsonObject par;
-    par["FileName"]   = "";
-    par["PlayMode"]   = "ByTime";
-    par["Channel"]    = channel0;
+    par["FileName"]   = file;
+    par["PlayMode"]   = "ByName";
     par["StreamType"] = 0;
     par["TransMode"]  = "TCP";
     par["Value"]      = 0;
     QJsonObject pb;
     pb["Action"]    = "Start";
-    pb["StartTime"] = from.toString("yyyy-MM-dd HH:mm:ss");
-    pb["EndTime"]   = to.toString("yyyy-MM-dd HH:mm:ss");
+    pb["StartTime"] = "2000-00-00 00:00:00";
+    pb["EndTime"]   = "2000-00-00 00:00:00";
     pb["Parameter"] = par;
     QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
-    // ответ не ждём: сразу после Start в сокет пойдёт медиапоток
+    sock_.write(packet(1420, QJsonDocument(o).toJson(QJsonDocument::Compact)));   // без ожидания
+    sock_.flush();
+    ++seq_;
+}
+
+void XmClient::playControl(const QString& action) {
+    QJsonObject pb; pb["Action"] = action;   // Fast/Slow/Pause/Continue
+    QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
+    sock_.write(packet(1420, QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    sock_.flush();
+    ++seq_;
+}
+
+void XmClient::playStop(const QString& file) {
+    QJsonObject par; par["FileName"] = file; par["PlayMode"] = "ByName";
+    par["StreamType"] = 0; par["TransMode"] = "TCP"; par["Value"] = 0;
+    QJsonObject pb; pb["Action"] = "Stop";
+    pb["StartTime"] = "2000-00-00 00:00:00"; pb["EndTime"] = "2000-00-00 00:00:00";
+    pb["Parameter"] = par;
+    QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
     sock_.write(packet(1420, QJsonDocument(o).toJson(QJsonDocument::Compact)));
     sock_.flush();
     ++seq_;

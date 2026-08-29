@@ -22,11 +22,16 @@ public:
     void    logout();
 
     // ---- архив (OPFileQuery / OPPlayBack) ----
-    // список записей канала (0-based) за интервал; постранично по 64 файла
-    QVector<QPair<QDateTime,QDateTime>> fileQuery(int channel0, const QDateTime& from,
-                                                  const QDateTime& to);
-    bool    playClaim(int channel0, const QDateTime& from, const QDateTime& to);  // 1424 Claim
-    void    playStart(int channel0, const QDateTime& from, const QDateTime& to);  // 1420 Start (без ожидания)
+    struct ArcFile { QDateTime b, e; QString name; int channel = 0; qint64 sizeKb = 0; };
+    // список ФАЙЛОВ записи канала (1-based) за интервал; постранично по 64 файла.
+    // stream: 0 = основной ("Main"/"h264"), 1 = субпоток ("Sub"/"Extra").
+    QVector<ArcFile> fileQuery(int channel1, const QDateTime& from, const QDateTime& to,
+                               int stream = 0);
+    // воспроизведение конкретного файла по имени (гарантированный канал):
+    bool    playClaimByName(const QString& file);   // 1424 Claim
+    void    playStartByName(const QString& file);    // 1420 Start (без ожидания ответа)
+    void    playControl(const QString& action);      // Fast/Slow/Pause/Continue (ускорение x2..)
+    void    playStop(const QString& file);           // Stop текущего файла
     QTcpSocket& sock() { return sock_; }   // читать медиапоток воспроизведения напрямую
 
     QString model, firmware, serial;

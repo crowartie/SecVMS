@@ -20,6 +20,7 @@ public:
     void setBuffer(int ms) { bufferUs_ = (long long)ms * 1000; }  // буфер сглаживания (джиттер), мс
     void setConnTimeout(int ms) { connMs_ = ms; }        // таймаут открытия потока, мс
     void setOneShot(bool on) { once_ = on; }   // архив: один проход, без переподключений
+    void setSpeed(double s) { speed_ = s; }    // скорость воспроизведения архива (1/2/4/8)
 signals:
     void frame(const QImage& img);
     void openFailed();               // не удалось открыть поток (камера недоступна?)
@@ -36,6 +37,7 @@ private:
     bool    hw_ = false;                    // GPU-декод (только для крупного вида)
     bool    udp_ = false;                   // транспорт RTSP: UDP вместо TCP
     std::atomic<bool>   once_{false};       // архив: один проход
+    std::atomic<double> speed_{1.0};        // скорость воспроизведения (архив)
     std::atomic<bool>   stop_{false};
     std::atomic<long long> deadline_{0};   // микросекунды av_gettime()
     std::atomic<int>    tw_{0}, th_{0};    // целевой размер (размер ячейки)
