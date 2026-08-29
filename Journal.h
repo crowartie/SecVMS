@@ -29,6 +29,7 @@ public:
     void error(const QString& src, const QString& t) { add("error", src, t); }
 
     const QVector<LogEntry>& entries() const { return entries_; }
+    void clear();                           // очистить и файл, и записи в памяти
     void loadRecent(int maxLines = 2000);   // подтянуть хвост файла при старте
 
 signals:

@@ -201,20 +201,24 @@ bool Decoder::openAndDecode() {
                         int stride[4]  = { (int)img.bytesPerLine(), 0, 0, 0 };
                         sws_scale(sws, show->data, show->linesize, 0, sh, dst, stride);
 
-                        // подождать «своего времени» кадра (ровная подача)
+                        // подождать «своего времени» кадра (ровная подача).
+                        // Буфер сглаживания: якорь старта сдвигаем в будущее на bufferUs —
+                        // все кадры показываются с задержкой buffer, что гасит сетевой джиттер.
                         long long nowUs = av_gettime();
+                        long long bufUs = bufferUs_.load();
                         int64_t bpts = frm->best_effort_timestamp;
                         long long targetUs;
                         if (bpts != AV_NOPTS_VALUE) {
                             long long ptsUs = (long long)(bpts * av_q2d(tb) * 1000000.0);
-                            if (firstPtsUs < 0) { firstPtsUs = ptsUs; startWallUs = nowUs; }
+                            if (firstPtsUs < 0) { firstPtsUs = ptsUs; startWallUs = nowUs + bufUs; }
                             targetUs = startWallUs + (ptsUs - firstPtsUs);
                             long long drift = targetUs - nowUs;
-                            if (drift > 700000 || drift < -300000) {   // скачок PTS / отстали — ресинхрон
-                                firstPtsUs = ptsUs; startWallUs = nowUs; targetUs = nowUs;
+                            // «убежали вперёд» разрешаем на величину буфера (+запас), назад — 300мс
+                            if (drift > bufUs + 700000 || drift < -300000) {   // скачок PTS / отстали — ресинхрон
+                                firstPtsUs = ptsUs; startWallUs = nowUs + bufUs; targetUs = nowUs + bufUs;
                             }
                         } else {
-                            targetUs = lastEmitUs ? lastEmitUs + frameDurUs : nowUs;
+                            targetUs = lastEmitUs ? lastEmitUs + frameDurUs : nowUs + bufUs;
                         }
                         while (!stop_) {
                             long long w = targetUs - av_gettime();
@@ -278,6 +282,7 @@ void VideoCell::play(const QString& url, bool hw) {
         pend_ = new Decoder(this);
         connect(pend_, &Decoder::frame, this, &VideoCell::onPendFrame, Qt::QueuedConnection);
         pend_->setTarget(width(), height());
+        pend_->setBuffer(bufMs_);
         pend_->begin(url, hw);
         return;
     }
@@ -293,7 +298,14 @@ void VideoCell::play(const QString& url, bool hw) {
     playing_ = true;
     kbps_ = 0;
     dec_->setTarget(width(), height());   // скейл под фактический размер ячейки
+    dec_->setBuffer(bufMs_);
     dec_->begin(url, hw);
+}
+
+void VideoCell::setBuffer(int ms) {
+    bufMs_ = ms;
+    if (dec_)  dec_->setBuffer(ms);
+    if (pend_) pend_->setBuffer(ms);
 }
 
 void VideoCell::onPendFrame(const QImage& img) {

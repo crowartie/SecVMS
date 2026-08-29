@@ -1,6 +1,7 @@
 #pragma once
 #include <QString>
 #include <QVector>
+#include <QStringList>
 
 // камера внутри устройства (канал регистратора)
 struct CamRef {
@@ -20,5 +21,8 @@ struct Device {
     int     channels = 0;
     bool    online = false;
     bool    checked = false;   // false = статус ещё не проверялся («Проверка...»)
+    QString layout;            // сохранённая раскладка этого рега: "1"/"4"/"9"/"16" или "RxC"; пусто = дефолт
+    QStringList customLayouts; // пользовательские сетки-кнопки ЭТОГО рега ("RxC"), не общие
+    int     bufferMs = -1;     // индивидуальный буфер сглаживания, мс; -1 = брать глобальный
     QVector<CamRef> cams;
 };

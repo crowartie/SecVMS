@@ -5,6 +5,7 @@
 #include "Types.h"
 
 class VideoWall;
+struct CamInfo;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QLabel;
@@ -17,13 +18,19 @@ class LiveView : public QWidget {
     Q_OBJECT
 public:
     LiveView(const Device& dev, bool hwDecode, const QStringList& layouts,
-             int defaultLayout = 4, QWidget* parent = nullptr);
+             int defaultLayout = 4, int bufferMs = 300, QWidget* parent = nullptr);
 
     int  deviceId() const { return dev_.id; }
     void setActive(bool on);              // вкладка выбрана: запустить/остановить потоки
     void setHwDecode(bool on);            // из настроек, на лету
+    void setBuffer(int ms);               // буфер сглаживания видео, мс (на лету)
+    void setOpenAllMode(bool autoFit, int maxCells);  // режим «Открыть все»
     void updateDevice(const Device& dev); // данные устройства изменились (имя/адрес)
+    QVector<int> shownChannels() const;   // каналы по слотам стены (-1 = пусто) — для сессии
+    QString currentLayoutKey() const;     // текущая раскладка стены ("16"/"5x4") — для сессии
+    void restoreShown(const QVector<int>& chans, const QString& layoutKey);  // восстановить
     void addCustomLayoutButton(int rows, int cols);
+    void removeCustomLayoutButton(const QString& key);
     bool inFullscreen() const { return fullscreen_; }
     void exitFullscreen();
 
@@ -31,9 +38,11 @@ signals:
     void fullscreenToggled(bool on);      // спрятать/вернуть шапку главного окна
     void camerasUpdated(int deviceId, QVector<CamRef> cams);  // имена/IP -> в конфиг
     void layoutAdded(const QString& key); // сохранена новая сетка "RxC"
+    void layoutChanged(int deviceId, const QString& key);  // выбрана раскладка -> в конфиг рега
 
 private:
     void buildUi();
+    QVector<CamInfo> camInfos() const;    // камеры устройства -> CamInfo (имена/URL/статус)
     void applyDevice();                   // камеры устройства -> стена (URL из данных)
     void populateOrgTree();
     void refreshTreeIcons();
@@ -42,9 +51,12 @@ private:
     void toggleFullscreen();
     void openLayoutDialog();
 
+    void applyLayoutKey(const QString& key);   // применить "1/4/9/16" или "RxC" к стене
+
     Device       dev_;
     bool         hwDecode_ = false;
     int          defaultLayout_ = 4;
+    int          bufferMs_ = 300;
     QStringList  layouts_;
 
     VideoWall*   wall_        = nullptr;

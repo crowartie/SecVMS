@@ -31,6 +31,11 @@ void Journal::add(const QString& level, const QString& source, const QString& te
     }
 }
 
+void Journal::clear() {
+    entries_.clear();
+    if (!path_.isEmpty()) QFile::remove(path_);
+}
+
 void Journal::loadRecent(int maxLines) {
     QFile f(path_);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;

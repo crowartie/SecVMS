@@ -14,6 +14,8 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
+#include <QMenu>
+#include <QContextMenuEvent>
 #include <cmath>
 #include <algorithm>
 
@@ -22,11 +24,11 @@ static const char* kCamMime = "application/x-secvms-cam";
 VideoWall::VideoWall(QWidget* parent)
     : QWidget(parent)
 {
-    setStyleSheet("background:#0a0d10;");
+    setStyleSheet("background:#0a0d10;");     // тёмный фон стены (тёмные тонкие зазоры) — как было
     setAcceptDrops(true);                    // приём перетаскивания из дерева
     grid_ = new QGridLayout(this);
-    grid_->setSpacing(1);                    // тонкий зазор, как в Smart PSS
-    grid_->setContentsMargins(2, 2, 3, 2);   // 2px от списка камер, 3px справа
+    grid_->setSpacing(3);                    // одинаковый зазор между ячейками
+    grid_->setContentsMargins(3, 3, 3, 3);   // и такой же отступ по краям (гап везде равный)
 
     // запуск ячеек по очереди, чтобы не открывать все RTSP-соединения разом
     startTimer_ = new QTimer(this);
@@ -49,6 +51,7 @@ void VideoWall::setCameras(const QVector<CamInfo>& cams) {
         auto* c = new VideoCell(this);
         c->setTitle(cams_[i].name);
         c->setStretch(stretch_);
+        c->setBuffer(bufMs_);
         if (cams_[i].status == 0) c->setOffline(true);   // офлайн по данным регистратора
         connect(c, &VideoCell::doubleClicked,  this, &VideoWall::onCellDouble);
         connect(c, &VideoCell::clicked,        this, &VideoWall::onCellClicked);
@@ -64,6 +67,19 @@ void VideoWall::setCameras(const QVector<CamInfo>& cams) {
     zoomed_ = -1;
     relayout();
     emit layoutChanged();
+}
+
+void VideoWall::refreshMeta(const QVector<CamInfo>& cams) {
+    // Обновить имена/состояние каналов БЕЗ пересборки стены: выведенный набор
+    // камер (slotCam_), раскладка и страница сохраняются — переключение вкладок
+    // и повторный опрос регистратора не сбрасывают показ.
+    if (cams.size() != cells_.size()) { setCameras(cams); return; }  // число камер изменилось — полная пересборка
+    for (int i = 0; i < cams.size(); ++i) {
+        cams_[i] = cams[i];
+        cells_[i]->setTitle(cams_[i].name);
+        cells_[i]->setOffline(cams_[i].status == 0);   // офлайн: стоп+«недоступна»; онлайн: снять флаг
+    }
+    if (active_ && populated_) applyStreams();   // снова онлайн — до-запустить, офлайн уже остановлены
 }
 
 QStringList VideoWall::cameraNames() const {
@@ -108,13 +124,92 @@ void VideoWall::setHwDecode(bool on) {
     if (active_ && populated_) restartAll();    // перезапустить с новым декодером
 }
 
+void VideoWall::setBuffer(int ms) {
+    if (bufMs_ == ms) return;
+    bufMs_ = ms;
+    for (auto* c : cells_) c->setBuffer(ms);    // применяется на лету (следующий ресинхрон)
+}
+
+QString VideoWall::layoutKey() const {
+    if (rowsOv_ > 0 && colsOv_ > 0)
+        return QString("%1x%2").arg(rowsOv_).arg(colsOv_);
+    return QString::number(pageCells_);
+}
+
 void VideoWall::populate() {
+    slotCam_.resize(cams_.size());   // после openAll(onlineOnly) массив мог быть короче
     for (int i = 0; i < cams_.size(); ++i) slotCam_[i] = i;   // от первой клетки по порядку
     populated_ = true;
     page_ = 0;
     zoomed_ = -1;
     relayout();
     emit layoutChanged();
+}
+
+void VideoWall::openAll(bool onlineOnly) {
+    // Собираем открываемые камеры (все / только в сети) и подбираем сетку РОВНО под их
+    // число, чтобы все влезли на ОДНУ страницу (без пагинации). Сохранённую раскладку
+    // рега это не перезаписывает — «Открыть все» лишь временно подстраивает вид.
+    QVector<int> show;
+    for (int i = 0; i < cams_.size(); ++i)
+        if (!(onlineOnly && cams_[i].status == 0)) show.append(i);
+    slotCam_.clear();
+    for (int c : show) slotCam_.append(c);          // размер = число камер -> ровно 1 страница
+    int n = qMax(1, (int)show.size());
+    if (openAllAuto_) {                              // авто: всё на одну страницу
+        int cols = (int)std::ceil(std::sqrt((double)n));
+        int rows = (int)std::ceil((double)n / cols);
+        rowsOv_ = rows; colsOv_ = cols; pageCells_ = rows * cols;
+    } else {                                         // фикс. максимальная сетка -> пагинация
+        rowsOv_ = 0; colsOv_ = 0; pageCells_ = qMax(1, openAllMaxCells_);
+    }
+    populated_ = true;
+    page_ = 0;
+    zoomed_ = -1;
+    relayout();
+    emit layoutChanged();
+}
+
+void VideoWall::closeAll() {
+    slotCam_.fill(-1, cams_.size());
+    zoomed_ = -1;
+    relayout();          // видимый набор пуст -> applyStreams остановит все потоки
+    emit layoutChanged();
+}
+
+void VideoWall::setSlotCams(const QVector<int>& s) {
+    // восстановление выведенного набора из сессии: слот -> индекс камеры
+    slotCam_ = s;
+    for (int& c : slotCam_)
+        if (c < -1 || c >= cams_.size()) c = -1;   // защита от рассинхрона со списком камер
+    populated_ = !slotCam_.isEmpty();
+    page_ = 0;
+    zoomed_ = -1;
+    relayout();
+    emit layoutChanged();
+}
+
+void VideoWall::setOpenAllMode(bool autoFit, int maxCells) {
+    openAllAuto_ = autoFit;
+    openAllMaxCells_ = qMax(1, maxCells);
+}
+
+bool VideoWall::hasDisplayed() const {
+    for (int c : slotCam_) if (c >= 0) return true;
+    return false;
+}
+
+void VideoWall::contextMenuEvent(QContextMenuEvent* e) {
+    QMenu menu(this);
+    // явный светлый стиль: иначе меню наследует тёмный фон стены (#0a0d10)
+    menu.setStyleSheet(
+        "QMenu{background:#ffffff;border:1px solid #c6ccd4;color:#2b2f36;}"
+        "QMenu::item{padding:6px 24px 6px 20px;}"
+        "QMenu::item:selected{background:#e8eef7;color:#1f6fd6;}"
+        "QMenu::item:disabled{color:#b0b6bd;background:transparent;}");
+    QAction* closeAll = menu.addAction(QStringLiteral("Закрыть все видео"));
+    closeAll->setEnabled(hasDisplayed());   // серым, если нет выведенных камер
+    if (menu.exec(e->globalPos()) == closeAll) this->closeAll();
 }
 
 void VideoWall::restartAll() {
@@ -260,10 +355,8 @@ void VideoWall::onCellDouble(VideoCell* c) {
 QWidget* VideoWall::emptyCell(int n) {
     while (empties_.size() <= n) {
         auto* f = new QWidget(this);
-        f->setAutoFillBackground(true);
-        QPalette pal = f->palette();
-        pal.setColor(QPalette::Window, QColor("#16191d"));   // пустой слот чуть светлее фона
-        f->setPalette(pal);
+        f->setAttribute(Qt::WA_StyledBackground, true);
+        f->setStyleSheet("background:#101418;");   // тёмный фон, как у ячейки (устойчиво к общему QSS)
         // тёмная иконка-заглушка камеры по центру, как в оригинале
         auto* l = new QVBoxLayout(f);
         l->setContentsMargins(0, 0, 0, 0);

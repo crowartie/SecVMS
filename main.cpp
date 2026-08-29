@@ -4,6 +4,7 @@
 #include <QPalette>
 #include <QColor>
 #include "MainWindow.h"
+#include "CheckStyle.h"
 #ifdef _WIN32
 #  include <windows.h>
 #  include <mmsystem.h>
@@ -23,7 +24,7 @@ int main(int argc, char** argv) {
     app.setOrganizationName("SecVMS");
     app.setWindowIcon(QIcon(
         QDir(QCoreApplication::applicationDirPath()).filePath("assets/app.ico")));
-    app.setStyle("Fusion");
+    app.setStyle(new CheckStyle("Fusion"));   // кастомный индикатор чекбоксов (галочка)
 
     // Принудительно светлая палитра (иначе Fusion берёт тёмную тему Windows)
     QPalette pal;

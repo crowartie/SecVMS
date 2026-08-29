@@ -21,7 +21,8 @@ class VideoWall : public QWidget {
 public:
     explicit VideoWall(QWidget* parent = nullptr);
 
-    void setCameras(const QVector<CamInfo>& cams);   // камеры выбранного устройства
+    void setCameras(const QVector<CamInfo>& cams);   // камеры выбранного устройства (полная пересборка)
+    void refreshMeta(const QVector<CamInfo>& cams);  // обновить имена/статус БЕЗ сброса показа
     void showWall();                 // страница открыта: запустить только видимые ячейки
     void hideWall();                 // страница закрыта: остановить все потоки
     void setLayout(int cells);       // 1,4,9,16 или 0 = все (квадратная сетка)
@@ -30,8 +31,16 @@ public:
     int  layoutCols() const { return colsOv_; }
     void setStretch(bool on);        // отрисовка: полноэкранное заполнение ячейки vs пропорции
     void setHwDecode(bool on);       // аппаратный декод для всех ячеек (флаг настроек)
+    void setBuffer(int ms);          // буфер сглаживания видео для всех ячеек, мс
+    QString layoutKey() const;       // текущая раскладка: "1"/"4"/"9"/"16" или "RxC"
     void populate();                 // разложить все камеры от первой клетки
+    void openAll(bool onlineOnly);   // вывести все камеры (или только те, что в сети)
+    void setOpenAllMode(bool autoFit, int maxCells);  // авто-подбор или макс. сетка
+    void closeAll();                 // убрать все камеры со стены (потоки стоп)
+    bool hasDisplayed() const;       // есть ли хоть одна выведенная камера
     bool isPopulated() const { return populated_; }
+    QVector<int> slotCams() const { return slotCam_; }   // выведенный набор (для сессии)
+    void setSlotCams(const QVector<int>& s);             // восстановить набор (сессия)
     void setPage(int p);
     int  currentPage() const { return page_; }
     int  pageCount() const;
@@ -54,6 +63,7 @@ public slots:
 protected:
     void dragEnterEvent(QDragEnterEvent*) override;   // приём перетаскивания из дерева
     void dropEvent(QDropEvent*) override;
+    void contextMenuEvent(QContextMenuEvent*) override;  // ПКМ по полю: «Закрыть все видео»
 
 private slots:
     void onCellDouble(VideoCell* c);
@@ -83,6 +93,9 @@ private:
     bool  hwAll_ = false;            // аппаратный декод и для сетки
     bool  useMain_ = false;          // основной поток вместо суб (сейчас всегда суб для сетки)
     bool  stretch_ = false;          // заполнять ячейку целиком
+    int   bufMs_ = 300;              // буфер сглаживания видео, мс (для новых ячеек)
+    bool  openAllAuto_ = true;       // «Открыть все»: подбирать сетку под число камер
+    int   openAllMaxCells_ = 16;     // иначе — фиксированная максимальная сетка
     int   pageCells_ = 4;            // раскладка по умолчанию 2×2, камеры не запущены
     int   rowsOv_ = 0, colsOv_ = 0;  // явная сетка rows×cols (0 = авто-квадрат)
     int   page_ = 0;

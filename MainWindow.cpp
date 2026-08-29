@@ -9,6 +9,9 @@
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QCheckBox>
+#include <QPolygonF>
+#include <QPen>
+#include <QPixmap>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QPushButton>
@@ -610,7 +613,18 @@ MainWindow::MainWindow(QWidget* parent)
         #mgmt { background:transparent; border:none; border-radius:6px; }
         #mgmt:hover { background:#dfe4ea; }
         #mgmtLbl { font-size:14px; font-weight:600; color:#2b2f36; }
-        QCheckBox::indicator { width:16px; height:16px; }
+        /* чекбоксы: белый квадрат с чёткой рамкой; при выборе — галочка (без заливки) */
+        QCheckBox { color:#3a414b; spacing:8px; }
+        QCheckBox:disabled { color:#a7adb5; }
+        /* неактивные поля — серые (видно, что заблокированы) */
+        QSpinBox:disabled, QComboBox:disabled, QLineEdit:disabled {
+            background:#eef1f4; color:#a7adb5; border:1px solid #dfe3e8; }
+        /* контекстные меню: белые, тёмный текст; неактивные пункты — серые */
+        QMenu { background:#ffffff; border:1px solid #c6ccd4; color:#2b2f36; }
+        QMenu::item { padding:6px 24px 6px 20px; }
+        QMenu::item:selected { background:#e8eef7; color:#1f6fd6; }
+        QMenu::item:disabled { color:#b0b6bd; background:transparent; }
+        QMenu::separator { height:1px; background:#e3e7ec; margin:4px 10px; }
         QPushButton#opbtn { border:none; background:transparent; min-width:22px; max-width:22px; height:22px; }
         QPushButton#opbtn:hover { background:#e4e8ee; border-radius:3px; }
         QTableWidget { background:#ffffff; border:1px solid #e3e7ec; gridline-color:#eef1f4; }
@@ -668,7 +682,6 @@ MainWindow::MainWindow(QWidget* parent)
         #setSection { font-size:14px; font-weight:700; color:#2b2f36; }
         #setHint    { font-size:12px; color:#8a92a0; }
     )");
-
     loadConfig();   // до построения UI: страница настроек читает значения конфига
 
     // журнал: файл рядом с конфигом, включённость — из настроек
@@ -706,6 +719,12 @@ MainWindow::MainWindow(QWidget* parent)
             if (r == QNetworkInformation::Reachability::Online)
                 QTimer::singleShot(1500, this, [this]{ checkAllDevices(); });
         });
+    }
+
+    // восстановление сессии: вернуть окно и открытые вкладки как были (после показа окна)
+    if (cfgRestoreSession_) {
+        if (cfgWindowMax_) QTimer::singleShot(0, this, [this]{ showMaximized(); });
+        QTimer::singleShot(0, this, [this]{ restoreSession(); });
     }
 }
 
@@ -947,7 +966,7 @@ QWidget* MainWindow::buildJournal() {
     connect(clr, &QPushButton::clicked, this, [this]{
         if (QMessageBox::question(this, QStringLiteral("Журнал"),
                 QStringLiteral("Очистить журнал?")) != QMessageBox::Yes) return;
-        QFile::remove(Journal::inst().filePath());
+        Journal::inst().clear();          // файл + записи в памяти (иначе фильтр их вернёт)
         journalTable_->setRowCount(0);
     });
     bar->addWidget(exp); bar->addWidget(clr);
@@ -1011,12 +1030,16 @@ QWidget* MainWindow::buildSettings() {
     scroll->setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }");
 
     auto* wrap = new QWidget;
-    auto* grid = new QGridLayout(wrap);
-    grid->setContentsMargins(24, 20, 24, 20);
-    grid->setSpacing(14);
-    grid->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    // Две независимые колонки-стопки (масонри): карточки пакуются вплотную с равным
+    // гапом, без выравнивания по рядам сетки — иначе из-за разной высоты «прыгают».
+    auto* cols = new QHBoxLayout(wrap);
+    cols->setContentsMargins(24, 20, 24, 20);
+    cols->setSpacing(14);
+    auto* colL = new QVBoxLayout; colL->setSpacing(14);
+    auto* colR = new QVBoxLayout; colR->setSpacing(14);
+    cols->addLayout(colL); cols->addLayout(colR); cols->addStretch(1);
 
-    int col = 0, row = 0;
+    int col = 0;
     // карточка-группа; возвращает layout для наполнения
     auto card = [&](const QString& title) {
         auto* c = new QFrame; c->setObjectName("setCard");
@@ -1025,8 +1048,8 @@ QWidget* MainWindow::buildSettings() {
         auto* v = new QVBoxLayout(c); v->setContentsMargins(20,14,20,16); v->setSpacing(9);
         auto* l = new QLabel(title); l->setObjectName("setSection");
         v->addWidget(l);
-        grid->addWidget(c, row, col, Qt::AlignTop);
-        if (++col >= 2) { col = 0; ++row; }
+        (col == 0 ? colL : colR)->addWidget(c, 0, Qt::AlignTop);
+        col ^= 1;
         return v;
     };
     // пометка для нереализованных контролов: серые, значения только отображаются
@@ -1071,12 +1094,65 @@ QWidget* MainWindow::buildSettings() {
             v->addLayout(rowl);
         }
         {
+            // Буфер сглаживания: гасит рывки на «подвисающих» регистраторах ценой задержки.
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Буфер сглаживания:"))));
-            auto* sp = new QSpinBox; sp->setRange(100, 2000); sp->setSingleStep(100);
+            rowl->addWidget(new QLabel(QStringLiteral("Буфер сглаживания (глобальный):")));
+            auto* sp = new QSpinBox; sp->setRange(0, 2000); sp->setSingleStep(100);
             sp->setSuffix(QStringLiteral(" мс")); sp->setValue(cfgBufferMs_);
-            soon(sp);
+            connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int ms){
+                cfgBufferMs_ = ms; saveConfig(); applyBufferToViews();
+            });
             rowl->addWidget(sp); rowl->addStretch();
+            v->addLayout(rowl);
+
+            auto* hint = new QLabel(QStringLiteral(
+                "Больше буфер — плавнее, но выше задержка. 0 — минимальная задержка."));
+            hint->setObjectName("fieldLbl"); hint->setWordWrap(true);
+            v->addWidget(hint);
+
+            // индивидуальные буферы по регистраторам (активны, когда галка снята);
+            // содержимое перестраивается rebuildSettingsDeviceLists() — список регов живой
+            bufferPerRegHost_ = new QWidget;
+            auto* perLay = new QVBoxLayout(bufferPerRegHost_);
+            perLay->setContentsMargins(16, 0, 0, 0); perLay->setSpacing(4);
+
+            auto* applyAll = new QCheckBox(QStringLiteral("Применять буфер ко всем регистраторам"));
+            applyAll->setChecked(cfgBufferApplyAll_);
+            connect(applyAll, &QCheckBox::toggled, this, [this, sp](bool on){
+                cfgBufferApplyAll_ = on; saveConfig(); applyBufferToViews();
+                sp->setEnabled(on);                       // общий буфер активен только с галкой
+                if (bufferPerRegHost_) bufferPerRegHost_->setEnabled(!on);  // индивидуальные — без
+            });
+            v->addWidget(applyAll);
+            sp->setEnabled(cfgBufferApplyAll_);
+            v->addWidget(bufferPerRegHost_);
+        }
+        {
+            // Режим «Открыть все камеры»: авто-подбор сетки под число камер, либо
+            // фиксированная максимальная сетка (тогда лишние — на других страницах).
+            auto* oaChk = new QCheckBox(QStringLiteral(
+                "«Открыть все»: автоподбор сетки под число камер"));
+            oaChk->setChecked(cfgOpenAllAuto_);
+            v->addWidget(oaChk);
+            auto* rowl = new QHBoxLayout;
+            rowl->addWidget(new QLabel(QStringLiteral(
+                "Иначе максимальная сетка:")));
+            auto* oaCb = new QComboBox;
+            oaCb->addItem(QStringLiteral("2×2"), 4);
+            oaCb->addItem(QStringLiteral("3×3"), 9);
+            oaCb->addItem(QStringLiteral("4×4"), 16);
+            oaCb->addItem(QStringLiteral("5×5"), 25);
+            oaCb->addItem(QStringLiteral("6×6"), 36);
+            { int i = oaCb->findData(cfgOpenAllMaxCells_); oaCb->setCurrentIndex(i < 0 ? 2 : i); }
+            oaCb->setEnabled(!cfgOpenAllAuto_);
+            connect(oaChk, &QCheckBox::toggled, this, [this, oaCb](bool on){
+                cfgOpenAllAuto_ = on; saveConfig(); applyOpenAllMode();
+                oaCb->setEnabled(!on);   // макс-сетка активна только без автоподбора
+            });
+            connect(oaCb, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, oaCb](int){
+                cfgOpenAllMaxCells_ = oaCb->currentData().toInt(); saveConfig(); applyOpenAllMode();
+            });
+            rowl->addWidget(oaCb); rowl->addStretch();
             v->addLayout(rowl);
         }
         auto* tt = new QCheckBox(QStringLiteral("Показывать подписи камер в ячейках"));
@@ -1102,19 +1178,19 @@ QWidget* MainWindow::buildSettings() {
         v->addWidget(au);
         auto* rest = new QCheckBox(QStringLiteral("Восстанавливать сессию при запуске"));
         rest->setChecked(cfgRestoreSession_);
-        soon(rest);
+        rest->setToolTip(QStringLiteral(
+            "Открытые вкладки регистраторов, их раскладки и состояние окна вернутся при следующем запуске"));
+        connect(rest, &QCheckBox::toggled, this, [this](bool on){
+            cfgRestoreSession_ = on; saveConfig();
+            if (on) saveSession();   // сразу зафиксировать текущее состояние
+        });
         v->addWidget(rest);
         {
             auto* rowl = new QHBoxLayout;
             rowl->addWidget(soon(new QLabel(QStringLiteral("Сразу открывать просмотр:"))));
-            auto* cb = new QComboBox;
-            cb->addItem(QStringLiteral("Нет"), -1);
-            for (const auto& d : devices_)
-                cb->addItem(d.name.isEmpty() ? d.ip : d.name, d.id);
-            int i = cb->findData(cfgAutoOpenDev_);
-            cb->setCurrentIndex(i < 0 ? 0 : i);
-            soon(cb);
-            rowl->addWidget(cb); rowl->addStretch();
+            autoOpenCombo_ = new QComboBox;    // наполняет rebuildSettingsDeviceLists()
+            soon(autoOpenCombo_);
+            rowl->addWidget(autoOpenCombo_); rowl->addStretch();
             v->addLayout(rowl);
         }
         auto* fs = new QCheckBox(QStringLiteral("Полноэкранный режим при запуске"));
@@ -1212,6 +1288,16 @@ QWidget* MainWindow::buildSettings() {
         v->addLayout(rowl);
     }
 
+    // ===== Пользовательские сетки (индивидуальны для каждого рега; удаление здесь) =====
+    {
+        auto* v = card(QStringLiteral("Пользовательские сетки"));
+        customGridsHost_ = new QWidget;
+        auto* hl = new QVBoxLayout(customGridsHost_);
+        hl->setContentsMargins(0, 0, 0, 0); hl->setSpacing(6);
+        v->addWidget(customGridsHost_);
+        rebuildCustomGrids();   // наполнить (и обновлять при изменениях/открытии)
+    }
+
     // ===== Конфигурация =====
     {
         auto* v = card(QStringLiteral("Конфигурация"));
@@ -1262,8 +1348,9 @@ QWidget* MainWindow::buildSettings() {
     // ===== О программе =====
     {
         auto* v = card(QStringLiteral("О программе"));
-        auto* about = new QLabel(QStringLiteral("SecVMS 1.0 — сборка от %1. Qt %2, FFmpeg.")
-                                     .arg(QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR)));
+        auto* about = new QLabel(QStringLiteral("SecVMS %1 — сборка от %2. Qt %3, FFmpeg.")
+                                     .arg(QStringLiteral(SECVMS_VERSION),
+                                          QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR)));
         about->setObjectName("setHint");
         v->addWidget(about);
         auto* hint = new QLabel(QStringLiteral(
@@ -1272,9 +1359,52 @@ QWidget* MainWindow::buildSettings() {
         v->addWidget(hint);
     }
 
+    colL->addStretch(1); colR->addStretch(1);   // карточки прижаты к верху колонок
     scroll->setWidget(wrap);
     outer->addWidget(scroll);
+    rebuildSettingsDeviceLists();   // наполнить списки регов (буферы, автооткрытие)
     return page;
+}
+
+// Перестроить в настройках всё, что перечисляет регистраторы: индивидуальные буферы
+// и комбо «Сразу открывать просмотр». Вызывается при открытии страницы настроек —
+// добавление/удаление/переименование устройств подхватывается без перезапуска.
+void MainWindow::rebuildSettingsDeviceLists() {
+    if (bufferPerRegHost_) {
+        auto* lay = qobject_cast<QVBoxLayout*>(bufferPerRegHost_->layout());
+        QLayoutItem* it;
+        while ((it = lay->takeAt(0)) != nullptr) {
+            if (it->widget()) it->widget()->deleteLater();
+            delete it;
+        }
+        for (const auto& d : devices_) {
+            int devId = d.id;
+            auto* row = new QWidget;
+            auto* r = new QHBoxLayout(row);
+            r->setContentsMargins(0, 0, 0, 0);
+            r->addWidget(new QLabel(d.name.isEmpty() ? d.ip : d.name));
+            r->addStretch();
+            auto* dsp = new QSpinBox; dsp->setRange(0, 2000); dsp->setSingleStep(100);
+            dsp->setSuffix(QStringLiteral(" мс"));
+            dsp->setValue(d.bufferMs >= 0 ? d.bufferMs : cfgBufferMs_);
+            connect(dsp, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, devId](int ms){
+                for (auto& dv : devices_) if (dv.id == devId) { dv.bufferMs = ms; break; }
+                saveConfig(); applyBufferToViews();
+            });
+            r->addWidget(dsp);
+            lay->addWidget(row);
+        }
+        bufferPerRegHost_->setEnabled(!cfgBufferApplyAll_);
+    }
+    if (autoOpenCombo_) {
+        QSignalBlocker block(autoOpenCombo_);   // не дёргать обработчики при перезаполнении
+        autoOpenCombo_->clear();
+        autoOpenCombo_->addItem(QStringLiteral("Нет"), -1);
+        for (const auto& d : devices_)
+            autoOpenCombo_->addItem(d.name.isEmpty() ? d.ip : d.name, d.id);
+        int i = autoOpenCombo_->findData(cfgAutoOpenDev_);
+        autoOpenCombo_->setCurrentIndex(i < 0 ? 0 : i);
+    }
 }
 
 // MAC устройства из ARP-кэша Windows (best-effort, после TCP-контакта)
@@ -1538,27 +1668,158 @@ void MainWindow::openDeviceView(int devId) {
             gotoPage(livePage_[devId], tabTitle);
             return;
         }
-        auto* view = new LiveView(*d, cfgHwDecode_, cfgLayouts_, cfgDefaultLayout_);
-        connect(view, &LiveView::fullscreenToggled, this, [this](bool on){
-            if (topBar_) topBar_->setVisible(!on);
-            on ? showFullScreen() : showNormal();
-        });
-        connect(view, &LiveView::camerasUpdated, this, [this](int id, QVector<CamRef> c){
-            for (auto& dv : devices_) if (dv.id == id) { dv.cams = c; break; }
-            saveConfig();
-        });
-        connect(view, &LiveView::layoutAdded, this, [this](const QString& key){
-            if (!cfgLayouts_.contains(key)) { cfgLayouts_ << key; saveConfig(); }
-            const QStringList p = key.split('x');
-            if (p.size() == 2)
-                for (auto* v : liveViews_) v->addCustomLayoutButton(p[0].toInt(), p[1].toInt());
-        });
-        int page = stack_->addWidget(view);
-        liveViews_[devId] = view;
-        livePage_[devId]  = page;
+        int page = createDeviceView(*d);
         gotoPage(page, tabTitle);
+        saveSession();
     });
     w->setFuture(QtConcurrent::run([dcopy]{ return fetchDeviceCameras(dcopy); }));
+}
+
+// Создать вьюху просмотра регистратора (стена + связи), зарегистрировать в картах.
+// Общий код для openDeviceView и восстановления сессии. Возвращает индекс страницы.
+int MainWindow::createDeviceView(const Device& d) {
+    auto* view = new LiveView(d, cfgHwDecode_, d.customLayouts, cfgDefaultLayout_, effBufferMs(d));
+    connect(view, &LiveView::fullscreenToggled, this, [this](bool on){
+        if (topBar_) topBar_->setVisible(!on);
+        on ? showFullScreen() : showNormal();
+    });
+    connect(view, &LiveView::camerasUpdated, this, [this](int id, QVector<CamRef> c){
+        for (auto& dv : devices_) if (dv.id == id) { dv.cams = c; break; }
+        saveConfig();
+    });
+    // новая пользовательская сетка сохраняется ТОЛЬКО у этого рега (не плодится на другие);
+    // кнопку на панель добавляет сам LiveView (openLayoutDialog).
+    int devId = d.id;
+    connect(view, &LiveView::layoutAdded, this, [this, devId](const QString& key){
+        for (auto& dv : devices_) if (dv.id == devId) {
+            if (!dv.customLayouts.contains(key)) { dv.customLayouts << key; saveConfig(); }
+            break;
+        }
+        rebuildCustomGrids();   // сразу показать новую сетку в настройках
+    });
+    // раскладка выбрана в этой вьюхе -> запомнить в конфиг именно этого рега
+    connect(view, &LiveView::layoutChanged, this, [this](int id, const QString& key){
+        for (auto& dv : devices_) if (dv.id == id) { dv.layout = key; break; }
+        saveConfig();
+    });
+    view->setOpenAllMode(cfgOpenAllAuto_, cfgOpenAllMaxCells_);
+    int page = stack_->addWidget(view);
+    liveViews_[d.id] = view;
+    livePage_[d.id]  = page;
+    return page;
+}
+
+int MainWindow::effBufferMs(const Device& d) const {
+    if (cfgBufferApplyAll_) return cfgBufferMs_;
+    return d.bufferMs >= 0 ? d.bufferMs : cfgBufferMs_;
+}
+
+void MainWindow::applyBufferToViews() {
+    for (auto it = liveViews_.begin(); it != liveViews_.end(); ++it) {
+        for (const auto& dv : devices_)
+            if (dv.id == it.key()) { it.value()->setBuffer(effBufferMs(dv)); break; }
+    }
+}
+
+void MainWindow::applyOpenAllMode() {
+    for (auto* v : liveViews_) v->setOpenAllMode(cfgOpenAllAuto_, cfgOpenAllMaxCells_);
+}
+
+void MainWindow::rebuildCustomGrids() {
+    if (!customGridsHost_) return;
+    auto* hl = qobject_cast<QVBoxLayout*>(customGridsHost_->layout());
+    if (!hl) return;
+    QLayoutItem* it;                                   // очистить прежнее содержимое
+    while ((it = hl->takeAt(0)) != nullptr) {
+        if (it->widget()) it->widget()->deleteLater();
+        delete it;
+    }
+    bool any = false;
+    for (auto& d : devices_) {
+        if (d.customLayouts.isEmpty()) continue;
+        any = true;
+        auto* dn = new QLabel(QStringLiteral("<b>%1</b>").arg(d.name.isEmpty() ? d.ip : d.name));
+        hl->addWidget(dn);
+        for (const QString& key : d.customLayouts) {
+            int devId = d.id;
+            const QString k = key;
+            auto* row = new QWidget;
+            auto* rl = new QHBoxLayout(row); rl->setContentsMargins(14, 0, 0, 0);
+            const QStringList pc = k.split('x');
+            QString label = (pc.size() == 2)
+                ? QStringLiteral("%1×%2 (%3 камер)")
+                      .arg(pc[0]).arg(pc[1]).arg(pc[0].toInt() * pc[1].toInt())
+                : k;
+            rl->addWidget(new QLabel(label));
+            rl->addStretch();
+            auto* del = new QPushButton(QStringLiteral("Удалить"));
+            del->setObjectName("tool");
+            rl->addWidget(del);
+            hl->addWidget(row);
+            connect(del, &QPushButton::clicked, this, [this, devId, k]{
+                for (auto& dv : devices_) if (dv.id == devId) { dv.customLayouts.removeAll(k); break; }
+                saveConfig();
+                if (liveViews_.contains(devId)) liveViews_[devId]->removeCustomLayoutButton(k);
+                rebuildCustomGrids();
+            });
+        }
+    }
+    if (!any) {
+        auto* hint = new QLabel(QStringLiteral(
+            "Пока нет. Создаются в просмотре: «Польз. план» → сетка → «Сохранить как кнопку»."));
+        hint->setObjectName("fieldLbl"); hint->setWordWrap(true);
+        hl->addWidget(hint);
+    }
+}
+
+// Запомнить открытые вкладки просмотра (по IP — стабильный ключ) и активную.
+void MainWindow::saveSession() {
+    cfgSessionOpen_.clear();
+    cfgSessionShown_.clear();
+    for (auto it = liveViews_.begin(); it != liveViews_.end(); ++it) {
+        int page = livePage_.value(it.key(), -1);
+        if (page > 0 && tabBox_.contains(page)) {          // вкладка реально открыта
+            for (const auto& dv : devices_)
+                if (dv.id == it.key() && !dv.ip.isEmpty()) {
+                    cfgSessionOpen_ << dv.ip;
+                    // и что было выведено на стену (каналы + раскладка на момент выхода)
+                    QVector<int> chans = it.value()->shownChannels();
+                    if (!chans.isEmpty())
+                        cfgSessionShown_[dv.ip] = { it.value()->currentLayoutKey(), chans };
+                    break;
+                }
+        }
+    }
+    cfgSessionActive_.clear();
+    int cur = stack_ ? stack_->currentIndex() : -1;
+    for (auto it = livePage_.begin(); it != livePage_.end(); ++it)
+        if (it.value() == cur)
+            for (const auto& dv : devices_)
+                if (dv.id == it.key()) { cfgSessionActive_ = dv.ip; break; }
+    saveConfig();
+}
+
+// Восстановить вкладки, открытые в прошлой сессии (по IP). Без опроса/модалки —
+// берём сохранённые камеры/раскладку; свежий опрос будет при клике по вкладке.
+void MainWindow::restoreSession() {
+    if (cfgSessionOpen_.isEmpty()) return;
+    int activePage = -1, firstPage = -1;
+    for (const QString& ip : cfgSessionOpen_) {
+        const Device* d = nullptr;
+        for (const auto& dv : devices_) if (dv.ip == ip) { d = &dv; break; }
+        if (!d || liveViews_.contains(d->id)) continue;
+        int page = createDeviceView(*d);
+        const QString title = QStringLiteral("Просмотр %1").arg(d->name.isEmpty() ? d->ip : d->name);
+        gotoPage(page, title);                              // создаёт вкладку
+        if (cfgSessionShown_.contains(ip)) {                // вернуть выведенные камеры как были
+            const auto& sh = cfgSessionShown_[ip];
+            liveViews_[d->id]->restoreShown(sh.second, sh.first);
+        }
+        if (firstPage < 0) firstPage = page;
+        if (ip == cfgSessionActive_) activePage = page;
+    }
+    int target = activePage > 0 ? activePage : firstPage;
+    if (target > 0) gotoPage(target);
 }
 
 QWidget* MainWindow::buildDevices() {
@@ -1719,6 +1980,14 @@ QWidget* MainWindow::buildDevices() {
             if (detLbl_) detLbl_->setText(QStringLiteral("Порт должен быть числом."));
             fPort_->setFocus(); return;
         }
+        // дубль: устройство с таким IP уже есть (кроме редактируемого сейчас)
+        for (const auto& dv : devices_)
+            if (dv.ip == ip && dv.id != editingId_) {
+                if (detLbl_) detLbl_->setText(QStringLiteral(
+                    "Устройство с таким IP уже добавлено: %1")
+                    .arg(dv.name.isEmpty() ? dv.ip : dv.name));
+                fIp_->setFocus(); return;
+            }
         QString user = fUser_->text();
         QString pass = fPass_->text();
         QString name = fName_->text();
@@ -1736,6 +2005,9 @@ QWidget* MainWindow::buildDevices() {
                 for (auto& dv : devices_) if (dv.id == editingId_) {
                     d.id = editingId_;
                     if (d.cams.isEmpty()) d.cams = dv.cams;   // офлайн-правка не теряет камеры
+                    d.layout        = dv.layout;          // правка не стирает сетку рега,
+                    d.customLayouts = dv.customLayouts;   // его пользовательские сетки
+                    d.bufferMs      = dv.bufferMs;        // и индивидуальный буфер
                     dv = d; break;
                 }
                 editingId_ = -1;
@@ -1743,7 +2015,13 @@ QWidget* MainWindow::buildDevices() {
                 d.id = nextId_++; devices_.append(d);
             }
             saveConfig(); rebuildDeviceTable(); rebuildDeviceTiles();
-            if (liveViews_.contains(d.id)) liveViews_[d.id]->updateDevice(d);  // открытая вьюха
+            if (liveViews_.contains(d.id)) {
+                liveViews_[d.id]->updateDevice(d);            // открытая вьюха
+                int pg = livePage_.value(d.id, -1);           // и заголовок её вкладки
+                if (pg > 0 && tabBtn_.contains(pg))
+                    tabBtn_[pg]->setText(QStringLiteral("Просмотр %1")
+                        .arg(d.name.isEmpty() ? d.ip : d.name));
+            }
             showAddPanel(false);   // очистка полей — внутри showAddPanel(false)
         });
         w->setFuture(QtConcurrent::run([ip, port, user, pass, name]{
@@ -1888,8 +2166,24 @@ void MainWindow::saveConfig() {
     // зарезервированные (функции в разработке)
     st["defaultStretch"]  = cfgDefaultStretch_;
     st["bufferMs"]        = cfgBufferMs_;
+    st["bufferApplyAll"]  = cfgBufferApplyAll_;
+    st["openAllAuto"]     = cfgOpenAllAuto_;
+    st["openAllMaxCells"] = cfgOpenAllMaxCells_;
     st["showTitles"]      = cfgShowTitles_;
     st["restoreSession"]  = cfgRestoreSession_;
+    st["sessionOpen"]     = QJsonArray::fromStringList(cfgSessionOpen_);
+    st["sessionActive"]   = cfgSessionActive_;
+    {   // какие камеры были выведены на стену (ip -> раскладка + каналы по слотам)
+        QJsonObject shown;
+        for (auto it = cfgSessionShown_.begin(); it != cfgSessionShown_.end(); ++it) {
+            QJsonObject e; e["layout"] = it.value().first;
+            QJsonArray a; for (int ch : it.value().second) a.append(ch);
+            e["slots"] = a;
+            shown[it.key()] = e;
+        }
+        st["sessionShown"] = shown;
+    }
+    st["windowMax"]       = cfgWindowMax_;
     st["autoOpenDevice"]  = cfgAutoOpenDev_;
     st["startFullscreen"] = cfgStartFullscreen_;
     st["hideCursor"]      = cfgHideCursor_;
@@ -1917,6 +2211,9 @@ void MainWindow::saveConfig() {
         o["password"] = d.pass;   // открытым текстом (личное использование)
         o["type"] = d.type; o["model"] = d.model;
         o["serial"] = d.serial; o["channels"] = d.channels;
+        o["layout"] = d.layout;          // персональная раскладка рега
+        o["customLayouts"] = QJsonArray::fromStringList(d.customLayouts);
+        o["bufferMs"] = d.bufferMs;       // персональный буфер (-1 = глобальный)
         QJsonArray cams;
         for (const auto& c : d.cams) {
             QJsonObject co;
@@ -1956,8 +2253,25 @@ void MainWindow::loadConfig() {
         cfgHeartbeatSec_  = qBound(5, st["heartbeatSec"].toInt(15), 300);
         cfgDefaultStretch_  = st["defaultStretch"].toBool(false);
         cfgBufferMs_        = st["bufferMs"].toInt(300);
+        cfgBufferApplyAll_  = st["bufferApplyAll"].toBool(true);
+        cfgOpenAllAuto_     = st["openAllAuto"].toBool(true);
+        cfgOpenAllMaxCells_ = st["openAllMaxCells"].toInt(16);
         cfgShowTitles_      = st["showTitles"].toBool(true);
         cfgRestoreSession_  = st["restoreSession"].toBool(false);
+        cfgSessionOpen_.clear();
+        for (const auto& v : st["sessionOpen"].toArray()) cfgSessionOpen_ << v.toString();
+        cfgSessionActive_   = st["sessionActive"].toString();
+        cfgSessionShown_.clear();
+        {
+            QJsonObject shown = st["sessionShown"].toObject();
+            for (auto it = shown.begin(); it != shown.end(); ++it) {
+                QJsonObject e = it.value().toObject();
+                QVector<int> chans;
+                for (const auto& v2 : e["slots"].toArray()) chans << v2.toInt();
+                cfgSessionShown_[it.key()] = { e["layout"].toString(), chans };
+            }
+        }
+        cfgWindowMax_       = st["windowMax"].toBool(false);
         cfgAutoOpenDev_     = st["autoOpenDevice"].toInt(-1);
         cfgStartFullscreen_ = st["startFullscreen"].toBool(false);
         cfgHideCursor_      = st["hideCursor"].toBool(false);
@@ -1987,6 +2301,10 @@ void MainWindow::loadConfig() {
             d.type = o["type"].toString();
             d.model = o["model"].toString(); d.serial = o["serial"].toString();
             d.channels = o["channels"].toInt();
+            d.layout = o["layout"].toString();
+            d.customLayouts.clear();
+            for (const auto& lv : o["customLayouts"].toArray()) d.customLayouts << lv.toString();
+            d.bufferMs = o["bufferMs"].toInt(-1);
             for (const auto& cv : o["cameras"].toArray()) {
                 QJsonObject co = cv.toObject();
                 d.cams.append({ co["name"].toString(), co["channel"].toInt(), co["ip"].toString() });
@@ -2052,7 +2370,6 @@ void MainWindow::checkAllDevices() {
     for (const auto& d : devices_) {
         int id = d.id; QString ip = d.ip;
         int port = d.port;   // управляющий порт (у TVT — 80, у Dahua — 37777, у XM — 34567)
-        QString user = d.user, pass = d.pass, proto = d.proto;
         auto* w = new QFutureWatcher<bool>(this);
         connect(w, &QFutureWatcher<bool>::finished, this, [this, w, id]{
             bool on = w->result();
@@ -2080,16 +2397,13 @@ void MainWindow::checkAllDevices() {
                 }
             w->deleteLater();
         });
-        w->setFuture(QtConcurrent::run([ip, port, user, pass, proto]{
-            if (proto == "dahua" || proto == "tvt") {   // достаточно живости порта
-                QTcpSocket s;
-                s.connectToHost(ip, (quint16)port);
-                bool ok = s.waitForConnected(3000);
-                s.abort();
-                return ok;
-            }
-            XmClient c; bool ok = c.login(ip, port, user, pass, 3000);
-            if (ok) c.logout();
+        w->setFuture(QtConcurrent::run([ip, port]{
+            // лёгкая проверка живости управляющего порта БЕЗ логина: полный DVRIP-вход
+            // каждые N секунд дёргает анти-брутфорс Xiongmai (регистратор банит IP)
+            QTcpSocket s;
+            s.connectToHost(ip, (quint16)port);
+            bool ok = s.waitForConnected(3000);
+            s.abort();
             return ok;
         }));
     }
@@ -2144,11 +2458,17 @@ void MainWindow::gotoPage(int page, const QString& tabTitle) {
         box->installEventFilter(this);
         tabsRow_->addWidget(box);
         tabBtn_[page] = t; tabBox_[page] = box; tabX_[page] = xx;
+    } else if (page != 0 && !tabTitle.isEmpty() && tabBtn_.contains(page)) {
+        tabBtn_[page]->setText(tabTitle);   // регистратор переименован — обновить вкладку
     }
     stack_->setCurrentIndex(page);
     // активна только вьюха текущей страницы (её потоки идут, остальные глушатся)
     for (auto it = liveViews_.begin(); it != liveViews_.end(); ++it)
         it.value()->setActive(livePage_.value(it.key(), -1) == page);
+    if (page == 3) {   // настройки: обновить всё, что перечисляет регистраторы
+        rebuildCustomGrids();
+        rebuildSettingsDeviceLists();
+    }
     if (page == 1) {           // страница выбора: обновить статусы устройств
         checkAllDevices();
         rebuildDeviceTiles();
@@ -2163,6 +2483,7 @@ void MainWindow::closeTab(int page) {
     tabsRow_->removeWidget(box);
     box->deleteLater();
     if (stack_->currentIndex() == page) gotoPage(0);
+    saveSession();   // вкладка закрыта — обновить список сессии
 }
 
 bool MainWindow::eventFilter(QObject* o, QEvent* e) {
@@ -2258,6 +2579,8 @@ void MainWindow::toggleMax() { isMaximized() ? showNormal() : showMaximized(); }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
     Journal::inst().info(QStringLiteral("Система"), QStringLiteral("Завершение работы"));
+    cfgWindowMax_ = isMaximized();
+    saveSession();   // запомнить открытые вкладки + активную + состояние окна
     for (auto* v : liveViews_) v->setActive(false);   // остановить все потоки
     QMainWindow::closeEvent(e);
 }

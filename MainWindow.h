@@ -57,6 +57,14 @@ private:
     // выбор регистратора / вьюхи просмотра
     void rebuildDeviceTiles();      // плитки со статусами (В сети / Не в сети / Проверка)
     void openDeviceView(int devId); // выбор регистратора: опрос + окно загрузки + вкладка
+    int  createDeviceView(const Device& d);    // создать вьюху+связи, вернуть индекс страницы
+    int  effBufferMs(const Device& d) const;   // буфер для рега: глобальный или индивидуальный
+    void applyBufferToViews();      // разослать актуальный буфер во все открытые вьюхи
+    void applyOpenAllMode();        // разослать режим «Открыть все» во все вьюхи
+    void rebuildCustomGrids();      // перезаполнить карточку «Пользовательские сетки»
+    void rebuildSettingsDeviceLists();  // списки регов в настройках (буферы, автооткрытие)
+    void saveSession();             // запомнить открытые вкладки/активную/раскладки
+    void restoreSession();          // восстановить вкладки при запуске
     void openAutoSearch();          // модалка автопоиска устройств в сегменте сети
     void buildPerfPopup(QPushButton* anchor);   // индикатор ЦПУ/ОЗУ в шапке
     void samplePerf();              // замер загрузки ЦПУ/ОЗУ
@@ -104,15 +112,26 @@ private:
     QLabel*    detLbl_ = nullptr;   // подпись «Найдено: ...» под кнопкой «Определить»
 
     QVector<Device> devices_;
+    QWidget* customGridsHost_ = nullptr;   // контейнер списка сеток в настройках (для live-обновления)
+    QWidget*   bufferPerRegHost_ = nullptr; // контейнер инд. буферов по регам (перестраиваемый)
+    QComboBox* autoOpenCombo_ = nullptr;    // «Сразу открывать просмотр» (перестраиваемый)
     bool     cfgHwDecode_ = false;  // settings.hwdecode из config.json
     QStringList cfgLayouts_;        // settings.layouts ("4x5", ...)
     int      cfgDefaultLayout_ = 4; // settings.defaultLayout: сетка при открытии (4/9/16)
     int      cfgHeartbeatSec_ = 15; // settings.heartbeatSec: период проверки устройств
     // --- зарезервировано (контролы на странице серые, значения хранятся в конфиге) ---
     bool     cfgDefaultStretch_  = false; // масштаб по умолчанию: полноэкранное заполнение
-    int      cfgBufferMs_        = 300;   // буфер сглаживания видео, мс
+    int      cfgBufferMs_        = 300;   // буфер сглаживания видео, мс (глобальный)
+    bool     cfgBufferApplyAll_  = true;  // применять глобальный буфер ко ВСЕМ регистраторам
+    bool     cfgOpenAllAuto_     = true;  // «Открыть все»: авто-подбор сетки под число камер
+    int      cfgOpenAllMaxCells_ = 16;    // иначе — максимальная сетка (4/9/16/25/36), с пагинацией
     bool     cfgShowTitles_      = true;  // подписи камер в ячейках
     bool     cfgRestoreSession_  = false; // восстанавливать сессию при запуске
+    QStringList cfgSessionOpen_;          // IP регистраторов с открытыми вкладками (для восстановления)
+    QString  cfgSessionActive_;           // IP активной вкладки
+    // ip -> {раскладка стены, каналы по слотам}: какие камеры были выведены
+    QMap<QString, QPair<QString, QVector<int>>> cfgSessionShown_;
+    bool     cfgWindowMax_       = false; // окно было развёрнуто
     int      cfgAutoOpenDev_     = -1;    // id устройства для автооткрытия просмотра (-1 = нет)
     bool     cfgStartFullscreen_ = false; // полноэкранный режим при запуске
     bool     cfgHideCursor_      = false; // скрывать курсор при бездействии

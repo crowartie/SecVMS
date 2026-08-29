@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QMenu>
 #include <QLineEdit>
 #include <QComboBox>
 #include <QLabel>
@@ -139,19 +140,42 @@ protected:
 // ------------------------------------------------------------------
 
 LiveView::LiveView(const Device& dev, bool hwDecode, const QStringList& layouts,
-                   int defaultLayout, QWidget* parent)
+                   int defaultLayout, int bufferMs, QWidget* parent)
     : QWidget(parent), dev_(dev), hwDecode_(hwDecode),
-      defaultLayout_(defaultLayout), layouts_(layouts)
+      defaultLayout_(defaultLayout), bufferMs_(bufferMs), layouts_(layouts)
 {
     buildUi();
-    if (defaultLayout_ == 1 || defaultLayout_ == 4 ||
-        defaultLayout_ == 9 || defaultLayout_ == 16)
+    if (wall_) wall_->setBuffer(bufferMs_);
+    // раскладка рега: если у устройства сохранена своя — применяем её, иначе дефолт
+    if (!dev_.layout.isEmpty())
+        applyLayoutKey(dev_.layout);
+    else if (defaultLayout_ == 1 || defaultLayout_ == 4 ||
+             defaultLayout_ == 9 || defaultLayout_ == 16)
         wall_->setLayout(defaultLayout_);
     applyDevice();
     for (const QString& key : layouts_) {
         const QStringList p = key.split('x');
         if (p.size() == 2) addCustomLayoutButton(p[0].toInt(), p[1].toInt());
     }
+}
+
+void LiveView::applyLayoutKey(const QString& key) {
+    if (!wall_) return;
+    if (key.contains('x')) {
+        const QStringList p = key.split('x');
+        if (p.size() == 2) wall_->setLayoutRC(p[0].toInt(), p[1].toInt());
+    } else {
+        wall_->setLayout(key.toInt());
+    }
+}
+
+void LiveView::setBuffer(int ms) {
+    bufferMs_ = ms;
+    if (wall_) wall_->setBuffer(ms);
+}
+
+void LiveView::setOpenAllMode(bool autoFit, int maxCells) {
+    if (wall_) wall_->setOpenAllMode(autoFit, maxCells);
 }
 
 void LiveView::buildUi() {
@@ -173,6 +197,30 @@ void LiveView::buildUi() {
     bl->addWidget(orgTree_, 1);
     lv->addWidget(box, 1);
     connect(orgTree_, &QTreeWidget::itemDoubleClicked, this, &LiveView::onTreeActivated);
+    // ПКМ по регистратору (корень дерева): открыть все / только в сети / закрыть все
+    orgTree_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(orgTree_, &QTreeWidget::customContextMenuRequested, this,
+            [this](const QPoint& pos){
+        if (!wall_) return;
+        QTreeWidgetItem* it = orgTree_->itemAt(pos);
+        if (!it || it->data(0, Qt::UserRole).toInt() != -1) return;  // только узел регистратора
+        QMenu menu(this);
+        menu.setStyleSheet(
+            "QMenu{background:#ffffff;border:1px solid #c6ccd4;color:#2b2f36;}"
+            "QMenu::item{padding:6px 24px 6px 20px;}"
+            "QMenu::item:selected{background:#e8eef7;color:#1f6fd6;}"
+            "QMenu::item:disabled{color:#b0b6bd;background:transparent;}"
+            "QMenu::separator{height:1px;background:#e3e7ec;margin:4px 10px;}");
+        QAction* aAll    = menu.addAction(QStringLiteral("Открыть все камеры"));
+        QAction* aOnline = menu.addAction(QStringLiteral("Открыть все камеры, которые в сети"));
+        menu.addSeparator();
+        QAction* aClose  = menu.addAction(QStringLiteral("Закрыть все камеры"));
+        aClose->setEnabled(wall_->hasDisplayed());   // серым, если нет выведенных
+        QAction* ch = menu.exec(orgTree_->viewport()->mapToGlobal(pos));
+        if      (ch == aAll)    wall_->openAll(false);
+        else if (ch == aOnline) wall_->openAll(true);
+        else if (ch == aClose)  wall_->closeAll();
+    });
     connect(search, &QLineEdit::textChanged, this, [this](const QString& q){
         for (int i = 0; i < orgTree_->topLevelItemCount(); ++i) {
             std::function<void(QTreeWidgetItem*)> walk = [&](QTreeWidgetItem* it){
@@ -238,7 +286,9 @@ void LiveView::buildUi() {
     struct L { const char* ic; int n; };
     for (auto l : { L{"grid1",1}, L{"grid4",4}, L{"grid9",9}, L{"grid16",16} }) {
         auto* b = lbtn(l.ic, QString::number(l.n));
-        connect(b, &QPushButton::clicked, this, [this,l]{ if (wall_) wall_->setLayout(l.n); });
+        connect(b, &QPushButton::clicked, this, [this,l]{
+            if (wall_) { wall_->setLayout(l.n); emit layoutChanged(dev_.id, wall_->layoutKey()); }
+        });
         th->addWidget(b);
     }
     editBtn_ = lbtn("edit", QStringLiteral("Польз. план (своя сетка)"));
@@ -254,7 +304,7 @@ void LiveView::buildUi() {
     updatePageLabel();
 }
 
-void LiveView::applyDevice() {
+QVector<CamInfo> LiveView::camInfos() const {
     QVector<CamInfo> cams;
     for (const auto& c : dev_.cams) {
         CamInfo ci;
@@ -264,25 +314,63 @@ void LiveView::applyDevice() {
         ci.status = c.status;   // состояние по данным регистратора
         cams << ci;
     }
-    wall_->setCameras(cams);
+    return cams;
+}
+
+void LiveView::applyDevice() {
+    wall_->setCameras(camInfos());   // полная пересборка стены (сброс показа)
     populateOrgTree();
 }
 
 void LiveView::updateDevice(const Device& dev) {
-    // считаем существенным изменением не только адрес/число камер, но и смену
-    // имени/IP/состояния любого канала — тогда переприменяем всё (дерево + ячейки
-    // + офлайн-пометки), а не только имена в дереве.
-    bool changed = dev.ip != dev_.ip || dev.rtspPort != dev_.rtspPort ||
-                   dev.user != dev_.user || dev.pass != dev_.pass ||
-                   dev.cams.size() != dev_.cams.size();
-    if (!changed)
+    // Три уровня обновления при повторном заходе/опросе регистратора:
+    //  1) СТРУКТУРНОЕ (адрес/порт/логин/число камер) — меняются URL потоков,
+    //     нужна полная пересборка стены (applyDevice).
+    //  2) МЕТА (только имя/IP/состояние каналов) — обновляем на месте (refreshMeta):
+    //     выведенный набор камер и раскладка СОХРАНЯЮТСЯ, переключение вкладок
+    //     не сбрасывает показ, но статусы/подписи/офлайн-пометки свежие.
+    //  3) без изменений — только перерисовать дерево.
+    const bool structural =
+        dev.ip != dev_.ip || dev.rtspPort != dev_.rtspPort ||
+        dev.user != dev_.user || dev.pass != dev_.pass ||
+        dev.cams.size() != dev_.cams.size();
+    bool meta = false;
+    if (!structural)
         for (int i = 0; i < dev.cams.size(); ++i)
             if (dev.cams[i].status != dev_.cams[i].status ||
                 dev.cams[i].name   != dev_.cams[i].name   ||
-                dev.cams[i].ip     != dev_.cams[i].ip) { changed = true; break; }
+                dev.cams[i].ip     != dev_.cams[i].ip) { meta = true; break; }
     dev_ = dev;
-    if (changed) applyDevice();
-    else populateOrgTree();
+    if (structural)      applyDevice();
+    else if (meta)     { wall_->refreshMeta(camInfos()); populateOrgTree(); }
+    else                 populateOrgTree();
+}
+
+QVector<int> LiveView::shownChannels() const {
+    // выведенный набор камер как НОМЕРА КАНАЛОВ (индексы нестабильны при переопросе)
+    QVector<int> out;
+    if (!wall_ || !wall_->isPopulated()) return out;
+    for (int cam : wall_->slotCams())
+        out << (cam >= 0 && cam < dev_.cams.size() ? dev_.cams[cam].channel : -1);
+    return out;
+}
+
+QString LiveView::currentLayoutKey() const {
+    return wall_ ? wall_->layoutKey() : QString();
+}
+
+void LiveView::restoreShown(const QVector<int>& chans, const QString& layoutKey) {
+    if (!wall_ || chans.isEmpty()) return;
+    if (!layoutKey.isEmpty()) applyLayoutKey(layoutKey);   // та же сетка, что была при закрытии
+    QVector<int> cells;   // не "slots" — это макрос Qt
+    for (int ch : chans) {
+        int idx = -1;
+        if (ch > 0)
+            for (int i = 0; i < dev_.cams.size(); ++i)
+                if (dev_.cams[i].channel == ch) { idx = i; break; }
+        cells << idx;
+    }
+    wall_->setSlotCams(cells);
 }
 
 void LiveView::setHwDecode(bool on) {
@@ -360,6 +448,7 @@ void LiveView::openLayoutDialog() {
     if (dlg.exec() != QDialog::Accepted || !wall_) return;
     int r = dlg.rowsV(), c = dlg.colsV();
     wall_->setLayoutRC(r, c);
+    emit layoutChanged(dev_.id, wall_->layoutKey());
     const QString key = QString("%1x%2").arg(r).arg(c);
     if (customBtns_.contains(key)) return;
     auto ans = QMessageBox::question(this, QStringLiteral("Польз. план"),
@@ -384,9 +473,16 @@ void LiveView::addCustomLayoutButton(int rows, int cols) {
         "  min-width:18px; max-width:18px; min-height:16px; max-height:16px; }"
         "QPushButton:hover { color:#1f6fd6; border-color:#1f6fd6; }");
     connect(b, &QPushButton::clicked, this, [this, rows, cols]{
-        if (wall_) wall_->setLayoutRC(rows, cols);
+        if (wall_) { wall_->setLayoutRC(rows, cols); emit layoutChanged(dev_.id, wall_->layoutKey()); }
     });
     barLay_->insertWidget(barLay_->indexOf(editBtn_), b);
     customBtns_[key] = b;
+}
+
+void LiveView::removeCustomLayoutButton(const QString& key) {
+    auto it = customBtns_.find(key);
+    if (it == customBtns_.end()) return;
+    it.value()->deleteLater();
+    customBtns_.erase(it);
 }
 
