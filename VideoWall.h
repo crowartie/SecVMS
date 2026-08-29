@@ -11,7 +11,8 @@ class QTimer;
 class QDragEnterEvent;
 class QDropEvent;
 
-struct CamInfo { QString name, sub, main; int status = -1; };  // status: 1 онлайн, 0 офлайн, -1 неизв.
+struct CamInfo { QString name, sub, main; int status = -1;    // status: 1 онлайн, 0 офлайн, -1 неизв.
+                 bool udp = false; };                          // транспорт RTSP устройства
 
 // Видеостена: ЖЁСТКАЯ сетка слотов (1/4/9/16), камеры раскладываются по слотам.
 // Стартует пустой: камеры появляются после перетаскивания регистратора/камеры
@@ -32,6 +33,8 @@ public:
     void setStretch(bool on);        // отрисовка: полноэкранное заполнение ячейки vs пропорции
     void setHwDecode(bool on);       // аппаратный декод для всех ячеек (флаг настроек)
     void setBuffer(int ms);          // буфер сглаживания видео для всех ячеек, мс
+    void setConnTimeout(int ms);     // таймаут подключения к потоку для всех ячеек, мс
+    void setShowTitles(bool on);     // подписи камер в ячейках
     QString layoutKey() const;       // текущая раскладка: "1"/"4"/"9"/"16" или "RxC"
     void populate();                 // разложить все камеры от первой клетки
     void openAll(bool onlineOnly);   // вывести все камеры (или только те, что в сети)
@@ -94,6 +97,8 @@ private:
     bool  useMain_ = false;          // основной поток вместо суб (сейчас всегда суб для сетки)
     bool  stretch_ = false;          // заполнять ячейку целиком
     int   bufMs_ = 300;              // буфер сглаживания видео, мс (для новых ячеек)
+    int   connMs_ = 5000;            // таймаут подключения к потоку, мс (для новых ячеек)
+    bool  titles_ = true;            // подписи камер в ячейках
     bool  openAllAuto_ = true;       // «Открыть все»: подбирать сетку под число камер
     int   openAllMaxCells_ = 16;     // иначе — фиксированная максимальная сетка
     int   pageCells_ = 4;            // раскладка по умолчанию 2×2, камеры не запущены

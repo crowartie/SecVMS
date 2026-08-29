@@ -15,7 +15,9 @@
 #include <QDropEvent>
 #include <QMimeData>
 #include <QMenu>
+#include <QMessageBox>
 #include <QContextMenuEvent>
+#include "Theme.h"
 #include <cmath>
 #include <algorithm>
 
@@ -50,8 +52,11 @@ void VideoWall::setCameras(const QVector<CamInfo>& cams) {
     for (int i = 0; i < cams_.size(); ++i) {
         auto* c = new VideoCell(this);
         c->setTitle(cams_[i].name);
+        c->setShowTitle(titles_);
         c->setStretch(stretch_);
         c->setBuffer(bufMs_);
+        c->setConnTimeout(connMs_);
+        c->setUdp(cams_[i].udp);
         if (cams_[i].status == 0) c->setOffline(true);   // офлайн по данным регистратора
         connect(c, &VideoCell::doubleClicked,  this, &VideoWall::onCellDouble);
         connect(c, &VideoCell::clicked,        this, &VideoWall::onCellClicked);
@@ -77,6 +82,7 @@ void VideoWall::refreshMeta(const QVector<CamInfo>& cams) {
     for (int i = 0; i < cams.size(); ++i) {
         cams_[i] = cams[i];
         cells_[i]->setTitle(cams_[i].name);
+        cells_[i]->setUdp(cams_[i].udp);
         cells_[i]->setOffline(cams_[i].status == 0);   // офлайн: стоп+«недоступна»; онлайн: снять флаг
     }
     if (active_ && populated_) applyStreams();   // снова онлайн — до-запустить, офлайн уже остановлены
@@ -128,6 +134,17 @@ void VideoWall::setBuffer(int ms) {
     if (bufMs_ == ms) return;
     bufMs_ = ms;
     for (auto* c : cells_) c->setBuffer(ms);    // применяется на лету (следующий ресинхрон)
+}
+
+void VideoWall::setConnTimeout(int ms) {
+    if (connMs_ == ms) return;
+    connMs_ = ms;
+    for (auto* c : cells_) c->setConnTimeout(ms);
+}
+
+void VideoWall::setShowTitles(bool on) {
+    titles_ = on;
+    for (auto* c : cells_) c->setShowTitle(on);
 }
 
 QString VideoWall::layoutKey() const {
@@ -201,15 +218,16 @@ bool VideoWall::hasDisplayed() const {
 
 void VideoWall::contextMenuEvent(QContextMenuEvent* e) {
     QMenu menu(this);
-    // явный светлый стиль: иначе меню наследует тёмный фон стены (#0a0d10)
-    menu.setStyleSheet(
-        "QMenu{background:#ffffff;border:1px solid #c6ccd4;color:#2b2f36;}"
-        "QMenu::item{padding:6px 24px 6px 20px;}"
-        "QMenu::item:selected{background:#e8eef7;color:#1f6fd6;}"
-        "QMenu::item:disabled{color:#b0b6bd;background:transparent;}");
+    // свой стиль по теме: иначе меню наследует тёмный фон стены (#0a0d10)
+    menu.setStyleSheet(Theme::menuQss());
     QAction* closeAll = menu.addAction(QStringLiteral("Закрыть все видео"));
     closeAll->setEnabled(hasDisplayed());   // серым, если нет выведенных камер
-    if (menu.exec(e->globalPos()) == closeAll) this->closeAll();
+    if (menu.exec(e->globalPos()) == closeAll) {
+        if (Theme::Opt::confirmCloseAll &&
+            QMessageBox::question(this, QStringLiteral("SecVMS"),
+                QStringLiteral("Закрыть все видео?")) != QMessageBox::Yes) return;
+        this->closeAll();
+    }
 }
 
 void VideoWall::restartAll() {

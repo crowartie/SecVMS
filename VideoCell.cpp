@@ -40,9 +40,10 @@ static AVBufferRef* sharedD3D11Device() {
 
 // ----------------------------- Decoder -----------------------------
 
-void Decoder::begin(const QString& url, bool hw) {
+void Decoder::begin(const QString& url, bool hw, bool udp) {
     url_ = url;
     hw_ = hw;
+    udp_ = udp;
     stop_ = false;
     start();   // QThread::run()
 }
@@ -63,6 +64,11 @@ int Decoder::interruptCb(void* ctx) {
 void Decoder::run() {
     while (!stop_) {
         bool ok = openAndDecode();
+        if (once_) {                            // архив: один проход и конец
+            if (!ok && !stop_) emit openFailed();
+            if (!stop_) emit eof();
+            return;
+        }
         if (!ok && !stop_) emit openFailed();   // поток не открылся — камера недоступна?
         // короткая пауза и новая попытка: молчащий канал (камера перезагружается)
         // надо подхватить сразу, как он оживёт
@@ -76,22 +82,23 @@ bool Decoder::openAndDecode() {
     fmt->interrupt_callback.callback = &Decoder::interruptCb;
     fmt->interrupt_callback.opaque   = this;
 
+    const long long connUs = (long long)connMs_.load() * 1000;   // таймаут из настроек
     AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "rtsp_flags",     "prefer_tcp", 0);
-    av_dict_set(&opts, "timeout",        "5000000", 0);   // 5 с на сокет (мкс);
+    av_dict_set(&opts, "rtsp_transport", udp_ ? "udp" : "tcp", 0);
+    if (!udp_) av_dict_set(&opts, "rtsp_flags", "prefer_tcp", 0);
+    av_dict_set(&opts, "timeout", QByteArray::number(connUs).constData(), 0);
                                                           // НЕ "stimeout" — в FFmpeg 5+ переименована
     av_dict_set(&opts, "max_delay",      "500000", 0);
     av_dict_set(&opts, "fflags",         "nobuffer", 0);
     av_dict_set(&opts, "probesize",       "262144", 0);   // быстрый старт: не ждать
     av_dict_set(&opts, "analyzeduration", "500000", 0);   // долгий анализ потока
 
-    deadline_ = av_gettime() + 5LL * 1000000;   // молчащий канал бросаем быстро
+    deadline_ = av_gettime() + connUs;   // молчащий канал бросаем быстро
     int r = avformat_open_input(&fmt, url_.toUtf8().constData(), nullptr, &opts);
     av_dict_free(&opts);
     if (r < 0) { if (fmt) avformat_free_context(fmt); return false; }
 
-    deadline_ = av_gettime() + 5LL * 1000000;
+    deadline_ = av_gettime() + connUs;
     if (avformat_find_stream_info(fmt, nullptr) < 0) { avformat_close_input(&fmt); return false; }
 
     int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -154,9 +161,10 @@ bool Decoder::openAndDecode() {
     if (frameDurUs < 10000 || frameDurUs > 200000) frameDurUs = 40000;
     long long startWallUs = 0, firstPtsUs = -1, lastEmitUs = 0;
     long long statBytes = 0, statT0 = av_gettime();   // счёт скорости потока
+    long long playedUs = 0, prevPtsUs = -1, lastProgUs = 0;   // позиция для архива
 
     while (!stop_) {
-        deadline_ = av_gettime() + 8LL * 1000000;
+        deadline_ = av_gettime() + connUs + 3LL * 1000000;   // чтение: таймаут + запас
         int rr = av_read_frame(fmt, pkt);
         if (rr < 0) break;                         // EOF/ошибка -> переподключение
         if (pkt->stream_index == vs) {
@@ -227,6 +235,22 @@ bool Decoder::openAndDecode() {
                         }
                         lastEmitUs = av_gettime();
                         emit frame(img);            // QImage COW -> живёт в очереди событий
+                        // позиция воспроизведения (архив): суммируем дельты PTS,
+                        // скачки (пропуск дыры регистратором) не считаем временем
+                        if (once_) {
+                            long long curPts = (bpts != AV_NOPTS_VALUE)
+                                ? (long long)(bpts * av_q2d(tb) * 1000000.0) : -1;
+                            if (curPts >= 0 && prevPtsUs >= 0 && curPts > prevPtsUs &&
+                                curPts - prevPtsUs < 500000)
+                                playedUs += curPts - prevPtsUs;
+                            else
+                                playedUs += frameDurUs;
+                            if (curPts >= 0) prevPtsUs = curPts;
+                            if (playedUs - lastProgUs > 200000) {   // раз в 0.2 с
+                                lastProgUs = playedUs;
+                                emit progress(playedUs / 1e6);
+                            }
+                        }
                     }
                     if (show == swf) av_frame_unref(swf);
                     av_frame_unref(frm);
@@ -283,7 +307,8 @@ void VideoCell::play(const QString& url, bool hw) {
         connect(pend_, &Decoder::frame, this, &VideoCell::onPendFrame, Qt::QueuedConnection);
         pend_->setTarget(width(), height());
         pend_->setBuffer(bufMs_);
-        pend_->begin(url, hw);
+        pend_->setConnTimeout(connMs_);
+        pend_->begin(url, hw, udp_);
         return;
     }
     // холодный старт
@@ -299,13 +324,20 @@ void VideoCell::play(const QString& url, bool hw) {
     kbps_ = 0;
     dec_->setTarget(width(), height());   // скейл под фактический размер ячейки
     dec_->setBuffer(bufMs_);
-    dec_->begin(url, hw);
+    dec_->setConnTimeout(connMs_);
+    dec_->begin(url, hw, udp_);
 }
 
 void VideoCell::setBuffer(int ms) {
     bufMs_ = ms;
     if (dec_)  dec_->setBuffer(ms);
     if (pend_) pend_->setBuffer(ms);
+}
+
+void VideoCell::setConnTimeout(int ms) {
+    connMs_ = ms;
+    if (dec_)  dec_->setConnTimeout(ms);
+    if (pend_) pend_->setConnTimeout(ms);
 }
 
 void VideoCell::onPendFrame(const QImage& img) {
@@ -341,7 +373,7 @@ void VideoCell::stop() {
 
 void VideoCell::ensureAlive() {
     // декодер сам переподключается в цикле run(); подстрахуемся, если поток умер
-    if (playing_ && dec_ && !dec_->isRunning()) dec_->begin(url_, hw_);
+    if (playing_ && dec_ && !dec_->isRunning()) dec_->begin(url_, hw_, udp_);
 }
 
 void VideoCell::onFrame(const QImage& img) {
@@ -389,7 +421,7 @@ void VideoCell::paintEvent(QPaintEvent*) {
                                                        : Err::text(Err::CamConnecting);
         p.drawText(rect(), Qt::AlignCenter, msg);
     }
-    if (!title_.isEmpty()) {
+    if (showTitle_ && !title_.isEmpty()) {
         QString t = " " + title_ + " ";
         QFontMetrics fm(font());
         int w = fm.horizontalAdvance(t) + 6, h = fm.height() + 4;

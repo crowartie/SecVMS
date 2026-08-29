@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "LiveView.h"
+#include "PlaybackView.h"
 #include "XmClient.h"
 #include "DahuaUtil.h"
 #include "Discovery.h"
@@ -72,7 +73,9 @@
 #include <QUrl>
 #include <QScrollArea>
 #include <QSlider>
+#include <QInputDialog>
 #include <functional>
+#include "Theme.h"
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -191,13 +194,15 @@ static void onvifDeviceInfo(const QString& ip, const QString& user, const QStrin
 // forward-декларации (определения ниже)
 static QString dahuaHttpGet(const QString& ip, const QString& user, const QString& pass,
                             const QString& pathQuery, int timeoutMs);
-static QVector<CamRef> tvtLapiChannels(const QString& ip, const QString& user, const QString& pass);
+static QVector<CamRef> tvtLapiChannels(const QString& ip, const QString& user, const QString& pass,
+                                       int timeoutMs = 6000);
 
 // Состояние камер Dahua: LogicDeviceManager getCameraState -> канал -> онлайн?
-static QMap<int,bool> dahuaCameraStates(const QString& ip, const QString& user, const QString& pass) {
+static QMap<int,bool> dahuaCameraStates(const QString& ip, const QString& user, const QString& pass,
+                                        int timeoutMs = 6000) {
     QMap<int,bool> st;
     QString body = dahuaHttpGet(ip, user, pass,
-        "LogicDeviceManager.cgi?action=getCameraState&uniqueChannels=-1", 6000);
+        "LogicDeviceManager.cgi?action=getCameraState&uniqueChannels=-1", timeoutMs);
     // строки вида: states[0].channel=0 ... states[0].connectionState=Connected
     static const QRegularExpression re("\\[(\\d+)\\][^\\n]*[Cc]onnectionState=(\\w+)");
     auto it = re.globalMatch(body);
@@ -210,15 +215,15 @@ static QMap<int,bool> dahuaCameraStates(const QString& ip, const QString& user, 
 
 // Единый ОПРОС РЕГИСТРАТОРА: имена каналов + какие онлайн/офлайн (за нас это знает
 // сам регистратор — не опрашиваем камеры по отдельности).
-static QVector<CamRef> fetchDeviceCameras(const Device& d) {
+static QVector<CamRef> fetchDeviceCameras(const Device& d, int timeoutMs = 6000) {
     if (d.proto == "tvt")
-        return tvtLapiChannels(d.ip, d.user, d.pass);   // имя + Status
+        return tvtLapiChannels(d.ip, d.user, d.pass, timeoutMs);   // имя + Status
 
     if (d.proto == "dahua") {
         QString remote = dahuaHttpGet(d.ip, d.user, d.pass,
-            "configManager.cgi?action=getConfig&name=RemoteDevice", 9000);
+            "configManager.cgi?action=getConfig&name=RemoteDevice", qMax(timeoutMs, 9000));
         QVector<CamRef> cams = parseDahuaRemoteDevice(remote);
-        QMap<int,bool> states = dahuaCameraStates(d.ip, d.user, d.pass);
+        QMap<int,bool> states = dahuaCameraStates(d.ip, d.user, d.pass, timeoutMs);
         for (auto& c : cams)
             if (states.contains(c.channel)) c.status = states[c.channel] ? 1 : 0;
         return cams;
@@ -226,7 +231,7 @@ static QVector<CamRef> fetchDeviceCameras(const Device& d) {
 
     // Xiongmai: один опрос регистратора — привязанные камеры + имена + online/offline
     XmClient c; QVector<CamRef> cams;
-    if (c.login(d.ip, d.port, d.user, d.pass)) {
+    if (c.login(d.ip, d.port, d.user, d.pass, timeoutMs)) {
         c.fetchTitles();    // OSD-имена каналов
         c.fetchCameras();   // NetWork.RemoteDeviceV3: ConfName + IP
         c.fetchStatus();    // NetWork.ChnStatus: online/offline
@@ -246,14 +251,15 @@ static QVector<CamRef> fetchDeviceCameras(const Device& d) {
 // TVT/Uniview LAPI: логин + список каналов с РЕАЛЬНЫМИ ИМЕНАМИ (и IP камер).
 // Digest realm "NVRDVR"; Qt сам считает digest через authenticationRequired.
 // Возвращает камеры только тех каналов, где реально привязано устройство.
-static QVector<CamRef> tvtLapiChannels(const QString& ip, const QString& user, const QString& pass) {
+static QVector<CamRef> tvtLapiChannels(const QString& ip, const QString& user, const QString& pass,
+                                       int timeoutMs) {
     QVector<CamRef> out;
     QNetworkAccessManager nam;
     QObject::connect(&nam, &QNetworkAccessManager::authenticationRequired,
                      [&](QNetworkReply*, QAuthenticator* a){ a->setUser(user); a->setPassword(pass); });
     auto req = [&](const QString& path, bool put) -> QByteArray {
         QNetworkRequest r(QUrl("http://" + ip + path));
-        r.setTransferTimeout(6000);
+        r.setTransferTimeout(timeoutMs);
         QNetworkReply* rep = put ? nam.put(r, QByteArray()) : nam.get(r);
         QEventLoop l; QObject::connect(rep, &QNetworkReply::finished, &l, &QEventLoop::quit); l.exec();
         QByteArray b = (rep->error() == QNetworkReply::NoError) ? rep->readAll() : QByteArray();
@@ -572,6 +578,8 @@ static Device buildDeviceFromProbe(const QString& ip, const QString& user, const
     return d;
 }
 
+extern bool g_secWatchdog;   // main.cpp: перезапуск при аварийном завершении
+
 static const int TOPBAR_H = 46;
 
 static QPixmap iconPix(const QString& name, int px) {
@@ -583,106 +591,11 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     setWindowFlags(Qt::FramelessWindowHint | Qt::Window);
+    setWindowTitle("SecVMS");   // по заголовку окно находит второй экземпляр (single instance)
     resize(1280, 760);
-    setStyleSheet(R"(
-        QMainWindow, #root { background:#e9edf0; }   /* светло-серый фон: хедер, футер, поля */
-        QWidget { color:#2b2f36; font-family:'Segoe UI'; font-size:13px; }
-        QStackedWidget { background:#e9edf0; }
-        #topbar { background:#e9edf0; }               /* шапка — тот же светло-серый */
-        #logo   { color:#2b2f36; font-size:17px; font-weight:700; }
-        QPushButton#tab { border:none; background:transparent; padding:0 12px; height:44px;
-                          font-size:15px; color:#5a6270; }
-        QPushButton#tab:hover { color:#1f6fd6; }
-        QPushButton#tab[active="true"] { color:#1f6fd6; font-weight:600; }
-        QPushButton#tabx { border:none; border-radius:8px; background:#c4cad3; color:#ffffff;
-                           font-size:9px; min-width:16px; max-width:16px; min-height:16px; max-height:16px; padding:0; }
-        QPushButton#tabx:hover { background:#e2574c; }
-        QPushButton#win, QPushButton#winClose { border:none; background:transparent;
-                          min-width:42px; max-width:42px; height:44px; font-size:15px; color:#5a6270; }
-        QPushButton#win:hover { background:#dce0e6; }
-        QPushButton#winClose:hover { background:#e81123; color:#ffffff; }
-        #homePage { background:#e9edf0; }              /* фон страницы серый */
-        #homeCard { background:#ffffff; border-radius:8px; }   /* центр — белая карточка */
-        #card { background:transparent; border:none; border-radius:6px; }
-        #card:hover { background:#f4f6f9; }
-        #cardTitle { font-size:19px; font-weight:700; color:#2b2f36; }
-        #cardDesc  { font-size:13px; color:#7a8290; }
-        #mgmtBar   { background:#e9edf0; }             /* футер — тот же светло-серый */
-        #mgmtTitle { color:#2b2f36; font-size:14px; font-weight:700; }
-        /* пункт футера: иконка слева, текст справа по ЛЕВОМУ краю (как в оригинале) */
-        #mgmt { background:transparent; border:none; border-radius:6px; }
-        #mgmt:hover { background:#dfe4ea; }
-        #mgmtLbl { font-size:14px; font-weight:600; color:#2b2f36; }
-        /* чекбоксы: белый квадрат с чёткой рамкой; при выборе — галочка (без заливки) */
-        QCheckBox { color:#3a414b; spacing:8px; }
-        QCheckBox:disabled { color:#a7adb5; }
-        /* неактивные поля — серые (видно, что заблокированы) */
-        QSpinBox:disabled, QComboBox:disabled, QLineEdit:disabled {
-            background:#eef1f4; color:#a7adb5; border:1px solid #dfe3e8; }
-        /* контекстные меню: белые, тёмный текст; неактивные пункты — серые */
-        QMenu { background:#ffffff; border:1px solid #c6ccd4; color:#2b2f36; }
-        QMenu::item { padding:6px 24px 6px 20px; }
-        QMenu::item:selected { background:#e8eef7; color:#1f6fd6; }
-        QMenu::item:disabled { color:#b0b6bd; background:transparent; }
-        QMenu::separator { height:1px; background:#e3e7ec; margin:4px 10px; }
-        QPushButton#opbtn { border:none; background:transparent; min-width:22px; max-width:22px; height:22px; }
-        QPushButton#opbtn:hover { background:#e4e8ee; border-radius:3px; }
-        QTableWidget { background:#ffffff; border:1px solid #e3e7ec; gridline-color:#eef1f4; }
-        QHeaderView::section { background:#f4f6f9; border:none; border-right:1px solid #eef1f4;
-                               border-bottom:1px solid #e3e7ec; padding:6px; color:#5a6270; }
-        #toolbar { background:#f4f6f9; border-bottom:1px solid #e3e7ec; }
-        QPushButton#lay { border:1px solid #d3d9e0; background:#ffffff; border-radius:3px;
-                          min-width:34px; height:26px; }
-        QPushButton#lay:hover { border-color:#1f6fd6; color:#1f6fd6; }
-        QPushButton#tool { background:#ffffff; border:1px solid #d9dee4; border-radius:3px; padding:6px 14px; }
-        QPushButton#tool:hover { border-color:#1f6fd6; color:#1f6fd6; }
-        #addpanel { background:#ffffff; border:1px solid #c6ccd4; border-radius:8px; }
-        #addTitle { font-size:14px; font-weight:600; color:#2b2f36; }
-        #fieldLbl { color:#5a6270; }
-        QLineEdit, QComboBox { border:1px solid #d3d9e0; border-radius:3px; padding:2px 8px;
-                               min-height:20px; max-height:22px; background:#ffffff; }
-        QLineEdit:focus, QComboBox:focus { border-color:#1f6fd6; }
-        QPushButton#primary { background:#1f6fd6; color:#ffffff; border:none; border-radius:3px; padding:7px 18px; }
-        QPushButton#primary:hover { background:#1a60ba; }
-        QPushButton#ghost { background:#ffffff; border:1px solid #d3d9e0; border-radius:3px; padding:7px 18px; }
-
-        /* --- страница «Просмотр»: левая панель — белый бокс на сером --- */
-        #orgpanel { background:#e9edf0; }
-        #orgBox   { background:#ffffff; border:1px solid #dfe3e8; border-radius:4px; }
-        #orgSearch { border:1px solid #d3d9e0; border-radius:3px; padding:2px 8px; background:#ffffff;
-                     min-height:20px; max-height:22px; }
-        QTreeWidget { background:#ffffff; border:none; outline:0; font-size:12px; color:#3a414b; }
-        QTreeWidget::item { height:24px; }
-        QTreeWidget::item:hover { background:#eef3fa; }
-        QTreeWidget::item:selected { background:#d5e3f7; color:#1f4e8f; }
-
-        /* --- нижняя панель видеостены: светлая; подсветка — сам значок при hover --- */
-        #livebar { background:#e9edf0; border-top:1px solid #dfe3e8; }
-        QPushButton#lbtn { border:none; background:transparent; min-width:28px; max-width:28px; height:24px; }
-        #pagelbl { color:#5a6270; font-size:12px; min-width:42px; }
-        #livebar QComboBox { background:#ffffff; color:#2b2f36; border:1px solid #d3d9e0; border-radius:3px;
-                             padding:0px 6px; min-height:18px; max-height:20px; min-width:96px; font-size:12px; }
-        #livebar QComboBox QAbstractItemView { background:#ffffff; color:#2b2f36; selection-background-color:#1f6fd6; }
-
-        /* --- страница выбора регистратора: плитки --- */
-        #selPage  { background:#e9edf0; }
-        #selTitle { font-size:14px; font-weight:700; color:#2b2f36; }
-        #devTile  { background:#ffffff; border:1px solid #dfe3e8; border-radius:6px; }
-        #devTile:hover { border-color:#1f6fd6; }
-        #devTile[off="true"] { background:#f0f2f4; }
-        #devTile[off="true"]:hover { border-color:#dfe3e8; }
-        #devTileName { font-size:14px; font-weight:600; color:#2b2f36; }
-        #devTileIp   { font-size:12px; color:#8a92a0; }
-        #devTileOn   { font-size:12px; color:#3ca35a; }
-        #devTileOff  { font-size:12px; color:#e2574c; }
-        #devTileWait { font-size:12px; color:#8a92a0; }
-
-        /* --- страница «Настройки» --- */
-        #setCard    { background:#ffffff; border:1px solid #dfe3e8; border-radius:6px; }
-        #setSection { font-size:14px; font-weight:700; color:#2b2f36; }
-        #setHint    { font-size:12px; color:#8a92a0; }
-    )");
     loadConfig();   // до построения UI: страница настроек читает значения конфига
+    Theme::Opt::confirmCloseAll = cfgConfirmCloseAll_;
+    applyTheme();   // палитра + глобальный QSS (светлая/тёмная тема)
 
     // журнал: файл рядом с конфигом, включённость — из настроек
     Journal::inst().setFile(appDataDir() + "/journal.log");
@@ -702,6 +615,8 @@ MainWindow::MainWindow(QWidget* parent)
     stack_->addWidget(buildDevices());       // 2
     stack_->addWidget(buildSettings());      // 3
     stack_->addWidget(buildJournal());       // 4
+    playback_ = new PlaybackView;            // 5 — «Воспроизведение» (архив)
+    stack_->addWidget(playback_);
     v->addWidget(stack_, 1);
     setCentralWidget(root);
 
@@ -722,10 +637,19 @@ MainWindow::MainWindow(QWidget* parent)
     }
 
     // восстановление сессии: вернуть окно и открытые вкладки как были (после показа окна)
-    if (cfgRestoreSession_) {
-        if (cfgWindowMax_) QTimer::singleShot(0, this, [this]{ showMaximized(); });
+    if (cfgRestoreSession_)
         QTimer::singleShot(0, this, [this]{ restoreSession(); });
-    }
+
+    // режим поста: автооткрытие просмотра, полноэкранный старт, «не спать», курсор, watchdog
+    pendingStartFullscreen_ = cfgStartFullscreen_;
+    if (!cfgAutoOpenIp_.isEmpty())
+        QTimer::singleShot(100, this, [this]{
+            for (const auto& d : devices_)
+                if (d.ip == cfgAutoOpenIp_) { openDeviceView(d.id); break; }
+        });
+    applyKeepAwake();
+    applyHideCursor();
+    g_secWatchdog = cfgWatchdog_;
 }
 
 QWidget* MainWindow::buildTopBar() {
@@ -840,7 +764,8 @@ QWidget* MainWindow::buildHome() {
     tg->addWidget(makeBigCard("live", "Просмотр в реальном\nвремени",
         "Просмотр каналов в реальном времени: запись, стоп-кадр и операции PTZ.", 1, "Просмотр"));
     tg->addWidget(makeBigCard("playback", "Воспроизведение",
-        "Поиск и воспроизведение видеозаписей каналов в дистанционном режиме, экспорт.", -1, ""));
+        "Архив регистратора одним 24-часовым видео: ползунок, зоны записи, переходы.",
+        5, "Воспроизведение"));
     tg->addStretch();
     wl->addWidget(card);
     v->addWidget(wrap, 1);
@@ -1084,12 +1009,14 @@ QWidget* MainWindow::buildSettings() {
         }
         {
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Масштаб по умолчанию:"))));
+            rowl->addWidget(new QLabel(QStringLiteral("Масштаб по умолчанию:")));
             auto* cb = new QComboBox;
             cb->addItem(QStringLiteral("Оригинал"));
             cb->addItem(QStringLiteral("Полноэкранный режим"));
             cb->setCurrentIndex(cfgDefaultStretch_ ? 1 : 0);
-            soon(cb);
+            connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i){
+                cfgDefaultStretch_ = (i == 1); saveConfig();   // для новых окон просмотра
+            });
             rowl->addWidget(cb); rowl->addStretch();
             v->addLayout(rowl);
         }
@@ -1157,7 +1084,10 @@ QWidget* MainWindow::buildSettings() {
         }
         auto* tt = new QCheckBox(QStringLiteral("Показывать подписи камер в ячейках"));
         tt->setChecked(cfgShowTitles_);
-        soon(tt);
+        connect(tt, &QCheckBox::toggled, this, [this](bool on){
+            cfgShowTitles_ = on; saveConfig();
+            for (auto* vv : liveViews_) vv->setShowTitles(on);   // на лету
+        });
         v->addWidget(tt);
     }
 
@@ -1187,29 +1117,61 @@ QWidget* MainWindow::buildSettings() {
         v->addWidget(rest);
         {
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Сразу открывать просмотр:"))));
+            rowl->addWidget(new QLabel(QStringLiteral("Сразу открывать просмотр:")));
             autoOpenCombo_ = new QComboBox;    // наполняет rebuildSettingsDeviceLists()
-            soon(autoOpenCombo_);
+            connect(autoOpenCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this](int){
+                cfgAutoOpenIp_ = autoOpenCombo_->currentData().toString(); saveConfig();
+            });
             rowl->addWidget(autoOpenCombo_); rowl->addStretch();
             v->addLayout(rowl);
         }
         auto* fs = new QCheckBox(QStringLiteral("Полноэкранный режим при запуске"));
         fs->setChecked(cfgStartFullscreen_);
-        soon(fs);
+        fs->setToolTip(QStringLiteral("Первый открытый просмотр разворачивается на весь экран (Esc — выход)"));
+        connect(fs, &QCheckBox::toggled, this, [this](bool on){ cfgStartFullscreen_ = on; saveConfig(); });
         v->addWidget(fs);
-        auto* hc = new QCheckBox(QStringLiteral("Скрывать курсор при бездействии"));
+        auto* hc = new QCheckBox(QStringLiteral("Скрывать курсор при бездействии (10 с)"));
         hc->setChecked(cfgHideCursor_);
-        soon(hc);
+        connect(hc, &QCheckBox::toggled, this, [this](bool on){
+            cfgHideCursor_ = on; saveConfig(); applyHideCursor();
+        });
         v->addWidget(hc);
+        auto* ka = new QCheckBox(QStringLiteral("Не давать компьютеру спать и гасить экран"));
+        ka->setChecked(cfgKeepAwake_);
+        connect(ka, &QCheckBox::toggled, this, [this](bool on){
+            cfgKeepAwake_ = on; saveConfig(); applyKeepAwake();
+        });
+        v->addWidget(ka);
+        auto* wd = new QCheckBox(QStringLiteral("Перезапускать приложение при сбое"));
+        wd->setChecked(cfgWatchdog_);
+        wd->setToolTip(QStringLiteral(
+            "После аварийного завершения SecVMS запустится снова\n(кроме падений в первую минуту — защита от цикла)"));
+        connect(wd, &QCheckBox::toggled, this, [this](bool on){
+            cfgWatchdog_ = on; saveConfig(); g_secWatchdog = on;
+        });
+        v->addWidget(wd);
         {
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Пароль на настройки и устройства:"))));
+            rowl->addWidget(new QLabel(QStringLiteral("Пароль на настройки и устройства:")));
             auto* pw = new QLineEdit; pw->setEchoMode(QLineEdit::Password);
             pw->setPlaceholderText(cfgAdminPass_.isEmpty()
                 ? QStringLiteral("не задан") : QStringLiteral("задан"));
-            pw->setFixedWidth(140);
-            soon(pw);
-            rowl->addWidget(pw); rowl->addStretch();
+            pw->setFixedWidth(120);
+            auto* setBtn = new QPushButton(QStringLiteral("Сохранить")); setBtn->setObjectName("tool");
+            setBtn->setToolTip(QStringLiteral("Пустое поле — снять пароль"));
+            connect(setBtn, &QPushButton::clicked, this, [this, pw]{
+                const QString p = pw->text();
+                cfgAdminPass_ = p.isEmpty() ? QString()   // хранится SHA-256, не сам пароль
+                    : QString::fromLatin1(QCryptographicHash::hash(
+                          p.toUtf8(), QCryptographicHash::Sha256).toHex());
+                adminUnlocked_ = true;   // мы уже внутри настроек
+                saveConfig();
+                pw->clear();
+                pw->setPlaceholderText(cfgAdminPass_.isEmpty()
+                    ? QStringLiteral("не задан") : QStringLiteral("задан"));
+            });
+            rowl->addWidget(pw); rowl->addWidget(setBtn); rowl->addStretch();
             v->addLayout(rowl);
         }
     }
@@ -1223,50 +1185,73 @@ QWidget* MainWindow::buildSettings() {
             auto* sp = new QSpinBox; sp->setRange(5, 300); sp->setSuffix(QStringLiteral(" с"));
             sp->setValue(cfgHeartbeatSec_);
             connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int sec){
-                cfgHeartbeatSec_ = sec; saveConfig();
-                if (heartbeat_) heartbeat_->setInterval(sec * 1000);
+                cfgHeartbeatSec_ = sec; saveConfig();   // период по умолчанию (тик 5 с общий)
             });
             rowl->addWidget(sp); rowl->addStretch();
             v->addLayout(rowl);
         }
         {
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Таймаут подключения к потоку:"))));
+            rowl->addWidget(new QLabel(QStringLiteral("Таймаут подключения к потоку:")));
             auto* sp = new QSpinBox; sp->setRange(3, 30); sp->setSuffix(QStringLiteral(" с"));
             sp->setValue(cfgConnTimeoutSec_);
-            soon(sp);
+            connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int sec){
+                cfgConnTimeoutSec_ = sec; saveConfig();
+                for (auto* vv : liveViews_) vv->setConnTimeout(sec * 1000);   // на лету
+            });
             rowl->addWidget(sp); rowl->addStretch();
             v->addLayout(rowl);
         }
+        {
+            auto* rowl = new QHBoxLayout;
+            rowl->addWidget(new QLabel(QStringLiteral("Таймаут опроса регистратора:")));
+            auto* sp = new QSpinBox; sp->setRange(3, 30); sp->setSuffix(QStringLiteral(" с"));
+            sp->setValue(cfgPollTimeoutSec_);
+            sp->setToolTip(QStringLiteral("Ожидание ответа вендорского протокола при входе на вкладку"));
+            connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int sec){
+                cfgPollTimeoutSec_ = sec; saveConfig();
+            });
+            rowl->addWidget(sp); rowl->addStretch();
+            v->addLayout(rowl);
+        }
+        {
+            auto* cap = new QLabel(QStringLiteral("По регистраторам:"));
+            cap->setObjectName("fieldLbl");
+            v->addWidget(cap);
+            connPerRegHost_ = new QWidget;   // наполняет rebuildSettingsDeviceLists()
+            auto* cl = new QVBoxLayout(connPerRegHost_);
+            cl->setContentsMargins(8, 0, 0, 0); cl->setSpacing(4);
+            v->addWidget(connPerRegHost_);
+        }
     }
 
-    // ===== Снимки и звук =====
+    // ===== Интерфейс =====
     {
-        auto* v = card(QStringLiteral("Снимки и звук"));
+        auto* v = card(QStringLiteral("Интерфейс"));
         {
             auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Папка снимков и записей:"))));
-            auto* ed = new QLineEdit(cfgSnapshotDir_);
-            ed->setPlaceholderText(QStringLiteral("не задана"));
-            auto* br = new QPushButton(QStringLiteral("Обзор...")); br->setObjectName("tool");
-            soon(ed); soon(br);
-            rowl->addWidget(ed, 1);
-            rowl->addWidget(br);
+            rowl->addWidget(new QLabel(QStringLiteral("Тема:")));
+            auto* cb = new QComboBox;
+            cb->addItem(QStringLiteral("Светлая"), "light");
+            cb->addItem(QStringLiteral("Тёмная"),  "dark");
+            cb->setCurrentIndex(cfgTheme_ == "dark" ? 1 : 0);
+            connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, cb](int){
+                cfgTheme_ = cb->currentData().toString(); saveConfig();
+                applyTheme();   // перекраска на лету
+            });
+            rowl->addWidget(cb); rowl->addStretch();
             v->addLayout(rowl);
         }
-        auto* snd = new QCheckBox(QStringLiteral("Звук на развёрнутой камере"));
-        snd->setChecked(cfgAudioEnabled_);
-        soon(snd);
-        v->addWidget(snd);
-        {
-            auto* rowl = new QHBoxLayout;
-            rowl->addWidget(soon(new QLabel(QStringLiteral("Громкость:"))));
-            auto* sl = new QSlider(Qt::Horizontal);
-            sl->setRange(0, 100); sl->setValue(cfgAudioVolume_); sl->setFixedWidth(160);
-            soon(sl);
-            rowl->addWidget(sl); rowl->addStretch();
-            v->addLayout(rowl);
-        }
+        auto* ce = new QCheckBox(QStringLiteral("Подтверждать выход из приложения"));
+        ce->setChecked(cfgConfirmExit_);
+        connect(ce, &QCheckBox::toggled, this, [this](bool on){ cfgConfirmExit_ = on; saveConfig(); });
+        v->addWidget(ce);
+        auto* cc = new QCheckBox(QStringLiteral("Подтверждать «закрыть все камеры»"));
+        cc->setChecked(cfgConfirmCloseAll_);
+        connect(cc, &QCheckBox::toggled, this, [this](bool on){
+            cfgConfirmCloseAll_ = on; saveConfig(); Theme::Opt::confirmCloseAll = on;
+        });
+        v->addWidget(cc);
     }
 
     // ===== Диагностика =====
@@ -1305,6 +1290,15 @@ QWidget* MainWindow::buildSettings() {
         path->setObjectName("setHint");
         path->setTextInteractionFlags(Qt::TextSelectableByMouse);
         v->addWidget(path);
+        auto* enc = new QCheckBox(QStringLiteral("Шифровать пароли устройств (DPAPI)"));
+        enc->setChecked(cfgEncryptPass_);
+        enc->setToolTip(QStringLiteral(
+            "Пароли в config.json шифруются ключом учётной записи Windows.\n"
+            "Такой конфиг не переносится на другой ПК или в другую учётку."));
+        connect(enc, &QCheckBox::toggled, this, [this](bool on){
+            cfgEncryptPass_ = on; saveConfig();   // перезаписать конфиг сразу
+        });
+        v->addWidget(enc);
         auto* rowl = new QHBoxLayout;
         auto mkBtn = [&](const QString& t){
             auto* b = new QPushButton(t); b->setObjectName("tool"); return b; };
@@ -1399,11 +1393,66 @@ void MainWindow::rebuildSettingsDeviceLists() {
     if (autoOpenCombo_) {
         QSignalBlocker block(autoOpenCombo_);   // не дёргать обработчики при перезаполнении
         autoOpenCombo_->clear();
-        autoOpenCombo_->addItem(QStringLiteral("Нет"), -1);
+        autoOpenCombo_->addItem(QStringLiteral("Нет"), QString());
         for (const auto& d : devices_)
-            autoOpenCombo_->addItem(d.name.isEmpty() ? d.ip : d.name, d.id);
-        int i = autoOpenCombo_->findData(cfgAutoOpenDev_);
+            autoOpenCombo_->addItem(d.name.isEmpty() ? d.ip : d.name, d.ip);
+        int i = autoOpenCombo_->findData(cfgAutoOpenIp_);
         autoOpenCombo_->setCurrentIndex(i < 0 ? 0 : i);
+    }
+    if (connPerRegHost_) {   // подключение по регистраторам: транспорт/период/тихий вход
+        auto* lay = qobject_cast<QVBoxLayout*>(connPerRegHost_->layout());
+        QLayoutItem* it;
+        while ((it = lay->takeAt(0)) != nullptr) {
+            if (it->widget()) it->widget()->deleteLater();
+            delete it;
+        }
+        for (const auto& d : devices_) {
+            int devId = d.id;
+            auto* row = new QWidget;
+            auto* r = new QHBoxLayout(row);
+            r->setContentsMargins(0, 0, 0, 0); r->setSpacing(8);
+            auto* nm = new QLabel(d.name.isEmpty() ? d.ip : d.name);
+            nm->setToolTip(d.ip);
+            r->addWidget(nm);
+            r->addStretch();
+            auto* tr = new QComboBox;
+            tr->addItem("TCP"); tr->addItem("UDP");
+            tr->setCurrentIndex(d.rtspUdp ? 1 : 0);
+            tr->setFixedWidth(58);
+            tr->setToolTip(QStringLiteral(
+                "Транспорт RTSP. TCP — надёжно; UDP — меньше задержка, возможны артефакты"));
+            connect(tr, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, devId](int i2){
+                for (auto& dv : devices_) if (dv.id == devId) {
+                    dv.rtspUdp = (i2 == 1); saveConfig();
+                    if (liveViews_.contains(devId))
+                        liveViews_[devId]->updateDevice(dv);   // перезапуск потоков с новым транспортом
+                    break;
+                }
+            });
+            r->addWidget(tr);
+            auto* hb = new QSpinBox;
+            hb->setRange(0, 300); hb->setSuffix(QStringLiteral(" с"));
+            hb->setSpecialValueText(QStringLiteral("глоб."));
+            hb->setValue(d.heartbeatSec);
+            hb->setFixedWidth(70);
+            hb->setToolTip(QStringLiteral("Период проверки этого регистратора; «глоб.» = общий"));
+            connect(hb, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, devId](int sec){
+                for (auto& dv : devices_) if (dv.id == devId) { dv.heartbeatSec = sec; break; }
+                saveConfig();
+            });
+            r->addWidget(hb);
+            auto* np = new QCheckBox(QStringLiteral("тихий вход"));
+            np->setChecked(d.noPollOnOpen);
+            np->setToolTip(QStringLiteral(
+                "Открывать вкладку без опроса регистратора\n"
+                "(для медленных, например TVT: холодный старт 5–10 с)"));
+            connect(np, &QCheckBox::toggled, this, [this, devId](bool on){
+                for (auto& dv : devices_) if (dv.id == devId) { dv.noPollOnOpen = on; break; }
+                saveConfig();
+            });
+            r->addWidget(np);
+            lay->addWidget(row);
+        }
     }
 }
 
@@ -1628,6 +1677,16 @@ void MainWindow::openDeviceView(int devId) {
     const QString tabTitle = QStringLiteral("Просмотр %1")
         .arg(dp->name.isEmpty() ? dp->ip : dp->name);
 
+    if (dp->noPollOnOpen) {
+        // «тихий вход»: без опроса и модалки — камеры/статусы из конфига
+        // (для медленных регистраторов, у TVT холодный старт LAPI 5–10 с)
+        if (liveViews_.contains(devId)) { gotoPage(livePage_[devId], tabTitle); return; }
+        int page = createDeviceView(*dp);
+        gotoPage(page, tabTitle);
+        saveSession();
+        return;
+    }
+
     // Любой вход в просмотр регистратора = свежий опрос (имена + состояние каналов):
     // и клик по плитке, и клик по уже открытой вкладке (при уходе с вкладки видео
     // глушится, поэтому возврат = повторный вход). Само окно просмотра
@@ -1672,7 +1731,8 @@ void MainWindow::openDeviceView(int devId) {
         gotoPage(page, tabTitle);
         saveSession();
     });
-    w->setFuture(QtConcurrent::run([dcopy]{ return fetchDeviceCameras(dcopy); }));
+    const int pollMs = cfgPollTimeoutSec_ * 1000;
+    w->setFuture(QtConcurrent::run([dcopy, pollMs]{ return fetchDeviceCameras(dcopy, pollMs); }));
 }
 
 // Создать вьюху просмотра регистратора (стена + связи), зарегистрировать в картах.
@@ -1703,6 +1763,9 @@ int MainWindow::createDeviceView(const Device& d) {
         saveConfig();
     });
     view->setOpenAllMode(cfgOpenAllAuto_, cfgOpenAllMaxCells_);
+    view->setConnTimeout(cfgConnTimeoutSec_ * 1000);
+    view->setShowTitles(cfgShowTitles_);
+    if (cfgDefaultStretch_) view->setScaleMode(true);   // «полноэкранный» масштаб по умолчанию
     int page = stack_->addWidget(view);
     liveViews_[d.id] = view;
     livePage_[d.id]  = page;
@@ -2171,6 +2234,13 @@ void MainWindow::saveConfig() {
     st["openAllMaxCells"] = cfgOpenAllMaxCells_;
     st["showTitles"]      = cfgShowTitles_;
     st["restoreSession"]  = cfgRestoreSession_;
+    st["theme"]           = cfgTheme_;
+    st["keepAwake"]       = cfgKeepAwake_;
+    st["watchdog"]        = cfgWatchdog_;
+    st["encryptPass"]     = cfgEncryptPass_;
+    st["confirmExit"]     = cfgConfirmExit_;
+    st["confirmCloseAll"] = cfgConfirmCloseAll_;
+    st["pollTimeoutSec"]  = cfgPollTimeoutSec_;
     st["sessionOpen"]     = QJsonArray::fromStringList(cfgSessionOpen_);
     st["sessionActive"]   = cfgSessionActive_;
     {   // какие камеры были выведены на стену (ip -> раскладка + каналы по слотам)
@@ -2184,14 +2254,11 @@ void MainWindow::saveConfig() {
         st["sessionShown"] = shown;
     }
     st["windowMax"]       = cfgWindowMax_;
-    st["autoOpenDevice"]  = cfgAutoOpenDev_;
+    st["autoOpenIp"]      = cfgAutoOpenIp_;
     st["startFullscreen"] = cfgStartFullscreen_;
     st["hideCursor"]      = cfgHideCursor_;
-    st["adminPass"]       = cfgAdminPass_;
+    st["adminPass"]       = cfgAdminPass_;   // SHA-256, не сам пароль
     st["connTimeoutSec"]  = cfgConnTimeoutSec_;
-    st["snapshotDir"]     = cfgSnapshotDir_;
-    st["audioEnabled"]    = cfgAudioEnabled_;
-    st["audioVolume"]     = cfgAudioVolume_;
     st["logEnabled"]      = cfgLogEnabled_;
     QJsonArray km;
     for (auto it = cfgKnownModels_.begin(); it != cfgKnownModels_.end(); ++it) {
@@ -2208,12 +2275,16 @@ void MainWindow::saveConfig() {
         o["name"] = d.name; o["ip"] = d.ip; o["port"] = d.port;
         o["proto"] = d.proto;
         o["rtspPort"] = d.rtspPort; o["user"] = d.user;
-        o["password"] = d.pass;   // открытым текстом (личное использование)
+        if (cfgEncryptPass_) o["passwordEnc"] = encPass(d.pass);  // DPAPI: ключ учётки Windows
+        else                 o["password"]    = d.pass;           // открытым текстом (осознанно)
         o["type"] = d.type; o["model"] = d.model;
         o["serial"] = d.serial; o["channels"] = d.channels;
         o["layout"] = d.layout;          // персональная раскладка рега
         o["customLayouts"] = QJsonArray::fromStringList(d.customLayouts);
         o["bufferMs"] = d.bufferMs;       // персональный буфер (-1 = глобальный)
+        o["rtspUdp"] = d.rtspUdp;
+        o["heartbeatSec"] = d.heartbeatSec;   // 0 = глобальный период
+        o["noPollOnOpen"] = d.noPollOnOpen;
         QJsonArray cams;
         for (const auto& c : d.cams) {
             QJsonObject co;
@@ -2258,6 +2329,13 @@ void MainWindow::loadConfig() {
         cfgOpenAllMaxCells_ = st["openAllMaxCells"].toInt(16);
         cfgShowTitles_      = st["showTitles"].toBool(true);
         cfgRestoreSession_  = st["restoreSession"].toBool(false);
+        cfgTheme_           = st["theme"].toString("light");
+        cfgKeepAwake_       = st["keepAwake"].toBool(false);
+        cfgWatchdog_        = st["watchdog"].toBool(false);
+        cfgEncryptPass_     = st["encryptPass"].toBool(false);
+        cfgConfirmExit_     = st["confirmExit"].toBool(false);
+        cfgConfirmCloseAll_ = st["confirmCloseAll"].toBool(false);
+        cfgPollTimeoutSec_  = qBound(3, st["pollTimeoutSec"].toInt(6), 30);
         cfgSessionOpen_.clear();
         for (const auto& v : st["sessionOpen"].toArray()) cfgSessionOpen_ << v.toString();
         cfgSessionActive_   = st["sessionActive"].toString();
@@ -2272,14 +2350,11 @@ void MainWindow::loadConfig() {
             }
         }
         cfgWindowMax_       = st["windowMax"].toBool(false);
-        cfgAutoOpenDev_     = st["autoOpenDevice"].toInt(-1);
+        cfgAutoOpenIp_      = st["autoOpenIp"].toString();
         cfgStartFullscreen_ = st["startFullscreen"].toBool(false);
         cfgHideCursor_      = st["hideCursor"].toBool(false);
         cfgAdminPass_       = st["adminPass"].toString();
-        cfgConnTimeoutSec_  = st["connTimeoutSec"].toInt(5);
-        cfgSnapshotDir_     = st["snapshotDir"].toString();
-        cfgAudioEnabled_    = st["audioEnabled"].toBool(false);
-        cfgAudioVolume_     = st["audioVolume"].toInt(80);
+        cfgConnTimeoutSec_  = qBound(3, st["connTimeoutSec"].toInt(5), 30);
         cfgLogEnabled_      = st["logEnabled"].toBool(false);
         cfgKnownModels_.clear();
         for (const auto& v : st["knownModels"].toArray()) {
@@ -2297,7 +2372,9 @@ void MainWindow::loadConfig() {
             d.rtspPort = o["rtspPort"].toInt(554);
             if (d.proto == "tvt" && (d.port == 554 || d.port == 0))
                 d.port = 80;   // управляющий порт TVT/ONVIF — 80 (миграция старого дефолта)
-            d.user = o["user"].toString(); d.pass = o["password"].toString();
+            d.user = o["user"].toString();
+            d.pass = o.contains("passwordEnc") ? decPass(o["passwordEnc"].toString())
+                                               : o["password"].toString();
             d.type = o["type"].toString();
             d.model = o["model"].toString(); d.serial = o["serial"].toString();
             d.channels = o["channels"].toInt();
@@ -2305,6 +2382,9 @@ void MainWindow::loadConfig() {
             d.customLayouts.clear();
             for (const auto& lv : o["customLayouts"].toArray()) d.customLayouts << lv.toString();
             d.bufferMs = o["bufferMs"].toInt(-1);
+            d.rtspUdp      = o["rtspUdp"].toBool(false);
+            d.heartbeatSec = o["heartbeatSec"].toInt(0);
+            d.noPollOnOpen = o["noPollOnOpen"].toBool(false);
             for (const auto& cv : o["cameras"].toArray()) {
                 QJsonObject co = cv.toObject();
                 d.cams.append({ co["name"].toString(), co["channel"].toInt(), co["ip"].toString() });
@@ -2361,13 +2441,18 @@ void MainWindow::loadConfig() {
 
 void MainWindow::startHeartbeat() {
     heartbeat_ = new QTimer(this);
-    connect(heartbeat_, &QTimer::timeout, this, &MainWindow::checkAllDevices);
-    heartbeat_->start(cfgHeartbeatSec_ * 1000);
-    QTimer::singleShot(400, this, &MainWindow::checkAllDevices);
+    // базовый тик 5 с; период каждого устройства свой (heartbeatSec, 0 = глобальный)
+    connect(heartbeat_, &QTimer::timeout, this, [this]{ checkAllDevices(false); });
+    heartbeat_->start(5000);
+    QTimer::singleShot(400, this, [this]{ checkAllDevices(true); });
 }
 
-void MainWindow::checkAllDevices() {
+void MainWindow::checkAllDevices(bool force) {
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     for (const auto& d : devices_) {
+        const int perMs = (d.heartbeatSec > 0 ? d.heartbeatSec : cfgHeartbeatSec_) * 1000;
+        if (!force && nowMs - hbLast_.value(d.id, 0) < perMs) continue;
+        hbLast_[d.id] = nowMs;
         int id = d.id; QString ip = d.ip;
         int port = d.port;   // управляющий порт (у TVT — 80, у Dahua — 37777, у XM — 34567)
         auto* w = new QFutureWatcher<bool>(this);
@@ -2432,6 +2517,20 @@ void MainWindow::showAddPanel(bool on) {
 
 void MainWindow::gotoPage(int page, const QString& tabTitle) {
     if (page < 0) return;
+    // «Устройства» и «Настройки» могут быть закрыты паролем администратора
+    if ((page == 2 || page == 3) && !cfgAdminPass_.isEmpty() && !adminUnlocked_) {
+        bool ok = false;
+        const QString p = QInputDialog::getText(this, QStringLiteral("SecVMS"),
+            QStringLiteral("Пароль администратора:"), QLineEdit::Password, QString(), &ok);
+        if (!ok) return;
+        const QString hash = QString::fromLatin1(
+            QCryptographicHash::hash(p.toUtf8(), QCryptographicHash::Sha256).toHex());
+        if (hash != cfgAdminPass_) {
+            QMessageBox::warning(this, QStringLiteral("SecVMS"), QStringLiteral("Неверный пароль."));
+            return;
+        }
+        adminUnlocked_ = true;   // до перезапуска приложения
+    }
     if (page != 0 && !tabBtn_.contains(page)) {
         auto* box = new QWidget; box->setAttribute(Qt::WA_Hover);
         auto* bl = new QHBoxLayout(box);
@@ -2469,10 +2568,20 @@ void MainWindow::gotoPage(int page, const QString& tabTitle) {
         rebuildCustomGrids();
         rebuildSettingsDeviceLists();
     }
+    if (playback_) {
+        if (page == 5) playback_->setDevices(devices_);   // свежий список устройств
+        else           playback_->stopPlayback();         // ушли — архивный поток стоп
+    }
     if (page == 1) {           // страница выбора: обновить статусы устройств
         checkAllDevices();
         rebuildDeviceTiles();
     }
+    // «полноэкранный режим при запуске»: первый открытый просмотр разворачиваем
+    if (pendingStartFullscreen_)
+        if (auto* lv = qobject_cast<LiveView*>(stack_->widget(page))) {
+            pendingStartFullscreen_ = false;
+            QTimer::singleShot(0, lv, [lv]{ lv->enterFullscreen(); });
+        }
     setActiveTab(page);
 }
 
@@ -2487,6 +2596,14 @@ void MainWindow::closeTab(int page) {
 }
 
 bool MainWindow::eventFilter(QObject* o, QEvent* e) {
+    if (cursorWatch_) {   // автоскрытие курсора: любая активность возвращает его
+        const auto t = e->type();
+        if (t == QEvent::MouseMove || t == QEvent::MouseButtonPress ||
+            t == QEvent::KeyPress  || t == QEvent::Wheel) {
+            if (cursorHidden_) { QGuiApplication::restoreOverrideCursor(); cursorHidden_ = false; }
+            if (cursorTimer_) cursorTimer_->start(10000);
+        }
+    }
     if (e->type() == QEvent::Enter || e->type() == QEvent::Leave) {
         for (auto it = tabBox_.begin(); it != tabBox_.end(); ++it) {
             if (it.value() == o) {
@@ -2577,8 +2694,45 @@ void MainWindow::samplePerf() {
 
 void MainWindow::toggleMax() { isMaximized() ? showNormal() : showMaximized(); }
 
+void MainWindow::applyTheme() {
+    Theme::dark = (cfgTheme_ == "dark");
+    qApp->setPalette(Theme::palette());
+    setStyleSheet(Theme::mainQss());
+    if (perfPopup_) perfPopup_->setStyleSheet(Theme::perfQss());
+}
+
+void MainWindow::applyKeepAwake() {
+#ifdef _WIN32
+    // пока идёт наблюдение — не даём системе уснуть и погасить монитор
+    if (cfgKeepAwake_) SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    else               SetThreadExecutionState(ES_CONTINUOUS);
+#endif
+}
+
+void MainWindow::applyHideCursor() {
+    if (cfgHideCursor_) {
+        if (!cursorTimer_) {
+            cursorTimer_ = new QTimer(this);
+            cursorTimer_->setSingleShot(true);
+            connect(cursorTimer_, &QTimer::timeout, this, [this]{
+                if (!cursorHidden_) { QGuiApplication::setOverrideCursor(Qt::BlankCursor); cursorHidden_ = true; }
+            });
+        }
+        if (!cursorWatch_) { qApp->installEventFilter(this); cursorWatch_ = true; }
+        cursorTimer_->start(10000);   // 10 с бездействия — спрятать курсор
+    } else {
+        if (cursorWatch_) { qApp->removeEventFilter(this); cursorWatch_ = false; }
+        if (cursorTimer_) cursorTimer_->stop();
+        if (cursorHidden_) { QGuiApplication::restoreOverrideCursor(); cursorHidden_ = false; }
+    }
+}
+
 void MainWindow::closeEvent(QCloseEvent* e) {
+    if (cfgConfirmExit_ &&
+        QMessageBox::question(this, QStringLiteral("SecVMS"),
+            QStringLiteral("Выйти из SecVMS?")) != QMessageBox::Yes) { e->ignore(); return; }
     Journal::inst().info(QStringLiteral("Система"), QStringLiteral("Завершение работы"));
+    if (playback_) playback_->stopPlayback();
     cfgWindowMax_ = isMaximized();
     saveSession();   // запомнить открытые вкладки + активную + состояние окна
     for (auto* v : liveViews_) v->setActive(false);   // остановить все потоки
@@ -2605,6 +2759,12 @@ void MainWindow::mouseMoveEvent(QMouseEvent* e) {
         move(e->globalPosition().toPoint() - dragPos_);
     QMainWindow::mouseMoveEvent(e);
 }
+void MainWindow::mouseDoubleClickEvent(QMouseEvent* e) {
+    // даблклик по шапке окна: развернуть на весь экран / вернуть размер
+    if (e->button() == Qt::LeftButton && e->position().y() <= TOPBAR_H) toggleMax();
+    QMainWindow::mouseDoubleClickEvent(e);
+}
+
 void MainWindow::mouseReleaseEvent(QMouseEvent* e) {
     dragging_ = false;
     QMainWindow::mouseReleaseEvent(e);

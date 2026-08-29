@@ -2,6 +2,9 @@
 #include <QString>
 #include <QList>
 #include <QMap>
+#include <QPair>
+#include <QVector>
+#include <QDateTime>
 #include <QTcpSocket>
 
 // Минимальный клиент протокола Xiongmai/Sofia (DVRIP, порт 34567):
@@ -17,6 +20,14 @@ public:
     void    fetchTitles();    // ChannelTitle -> titles (имена каналов с регистратора)
     void    fetchStatus();    // NetWork.ChnStatus -> online/offline цифровых каналов
     void    logout();
+
+    // ---- архив (OPFileQuery / OPPlayBack) ----
+    // список записей канала (0-based) за интервал; постранично по 64 файла
+    QVector<QPair<QDateTime,QDateTime>> fileQuery(int channel0, const QDateTime& from,
+                                                  const QDateTime& to);
+    bool    playClaim(int channel0, const QDateTime& from, const QDateTime& to);  // 1424 Claim
+    void    playStart(int channel0, const QDateTime& from, const QDateTime& to);  // 1420 Start (без ожидания)
+    QTcpSocket& sock() { return sock_; }   // читать медиапоток воспроизведения напрямую
 
     QString model, firmware, serial;
     int     channels = 0;

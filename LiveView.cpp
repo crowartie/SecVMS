@@ -3,6 +3,7 @@
 #include "XmClient.h"
 #include "DahuaUtil.h"
 #include "StreamUrl.h"
+#include "Theme.h"
 #include <QApplication>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -174,6 +175,19 @@ void LiveView::setBuffer(int ms) {
     if (wall_) wall_->setBuffer(ms);
 }
 
+void LiveView::setConnTimeout(int ms) {
+    if (wall_) wall_->setConnTimeout(ms);
+}
+
+void LiveView::setShowTitles(bool on) {
+    if (wall_) wall_->setShowTitles(on);
+}
+
+void LiveView::setScaleMode(bool stretch) {
+    if (scaleCombo_) scaleCombo_->setCurrentIndex(stretch ? 1 : 0);   // сработает его connect
+    else if (wall_)  wall_->setStretch(stretch);
+}
+
 void LiveView::setOpenAllMode(bool autoFit, int maxCells) {
     if (wall_) wall_->setOpenAllMode(autoFit, maxCells);
 }
@@ -205,12 +219,7 @@ void LiveView::buildUi() {
         QTreeWidgetItem* it = orgTree_->itemAt(pos);
         if (!it || it->data(0, Qt::UserRole).toInt() != -1) return;  // только узел регистратора
         QMenu menu(this);
-        menu.setStyleSheet(
-            "QMenu{background:#ffffff;border:1px solid #c6ccd4;color:#2b2f36;}"
-            "QMenu::item{padding:6px 24px 6px 20px;}"
-            "QMenu::item:selected{background:#e8eef7;color:#1f6fd6;}"
-            "QMenu::item:disabled{color:#b0b6bd;background:transparent;}"
-            "QMenu::separator{height:1px;background:#e3e7ec;margin:4px 10px;}");
+        menu.setStyleSheet(Theme::menuQss());
         QAction* aAll    = menu.addAction(QStringLiteral("Открыть все камеры"));
         QAction* aOnline = menu.addAction(QStringLiteral("Открыть все камеры, которые в сети"));
         menu.addSeparator();
@@ -219,7 +228,12 @@ void LiveView::buildUi() {
         QAction* ch = menu.exec(orgTree_->viewport()->mapToGlobal(pos));
         if      (ch == aAll)    wall_->openAll(false);
         else if (ch == aOnline) wall_->openAll(true);
-        else if (ch == aClose)  wall_->closeAll();
+        else if (ch == aClose) {
+            if (Theme::Opt::confirmCloseAll &&
+                QMessageBox::question(this, QStringLiteral("SecVMS"),
+                    QStringLiteral("Закрыть все камеры?")) != QMessageBox::Yes) return;
+            wall_->closeAll();
+        }
     });
     connect(search, &QLineEdit::textChanged, this, [this](const QString& q){
         for (int i = 0; i < orgTree_->topLevelItemCount(); ++i) {
@@ -271,7 +285,8 @@ void LiveView::buildUi() {
     th->addWidget(prev); th->addWidget(pageLbl_); th->addWidget(next);
     th->addStretch();
 
-    auto* scale = new QComboBox;
+    scaleCombo_ = new QComboBox;
+    auto* scale = scaleCombo_;
     scale->addItem("Оригинал"); scale->addItem("Полноэкранный режим");
     scale->setItemData(0, "Оригинал", Qt::ToolTipRole);
     scale->setItemData(1, "Полноэкранный режим", Qt::ToolTipRole);
@@ -312,6 +327,7 @@ QVector<CamInfo> LiveView::camInfos() const {
         ci.sub  = streamUrl(dev_, c.channel, false);
         ci.main = streamUrl(dev_, c.channel, true);
         ci.status = c.status;   // состояние по данным регистратора
+        ci.udp    = dev_.rtspUdp;   // транспорт RTSP устройства
         cams << ci;
     }
     return cams;
@@ -333,6 +349,7 @@ void LiveView::updateDevice(const Device& dev) {
     const bool structural =
         dev.ip != dev_.ip || dev.rtspPort != dev_.rtspPort ||
         dev.user != dev_.user || dev.pass != dev_.pass ||
+        dev.rtspUdp != dev_.rtspUdp ||        // смена транспорта = перезапуск потоков
         dev.cams.size() != dev_.cams.size();
     bool meta = false;
     if (!structural)
@@ -467,11 +484,7 @@ void LiveView::addCustomLayoutButton(int rows, int cols) {
     auto* b = new QPushButton(QString::number(rows * cols));
     b->setToolTip(QStringLiteral("Сетка %1×%2 (%3 камер)").arg(rows).arg(cols).arg(rows*cols));
     b->setCursor(Qt::PointingHandCursor);
-    b->setStyleSheet(
-        "QPushButton { border:1px solid #9aa1ab; border-radius:2px; background:transparent;"
-        "  color:#5a6270; font-size:11px; padding:0;"
-        "  min-width:18px; max-width:18px; min-height:16px; max-height:16px; }"
-        "QPushButton:hover { color:#1f6fd6; border-color:#1f6fd6; }");
+    b->setStyleSheet(Theme::customBtnQss());
     connect(b, &QPushButton::clicked, this, [this, rows, cols]{
         if (wall_) { wall_->setLayoutRC(rows, cols); emit layoutChanged(dev_.id, wall_->layoutKey()); }
     });

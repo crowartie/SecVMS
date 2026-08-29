@@ -6,6 +6,7 @@
 
 class VideoWall;
 struct CamInfo;
+class QComboBox;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QLabel;
@@ -24,6 +25,9 @@ public:
     void setActive(bool on);              // вкладка выбрана: запустить/остановить потоки
     void setHwDecode(bool on);            // из настроек, на лету
     void setBuffer(int ms);               // буфер сглаживания видео, мс (на лету)
+    void setConnTimeout(int ms);          // таймаут подключения к потоку, мс (на лету)
+    void setShowTitles(bool on);          // подписи камер в ячейках (на лету)
+    void setScaleMode(bool stretch);      // масштаб: false=оригинал, true=заполнить
     void setOpenAllMode(bool autoFit, int maxCells);  // режим «Открыть все»
     void updateDevice(const Device& dev); // данные устройства изменились (имя/адрес)
     QVector<int> shownChannels() const;   // каналы по слотам стены (-1 = пусто) — для сессии
@@ -32,6 +36,7 @@ public:
     void addCustomLayoutButton(int rows, int cols);
     void removeCustomLayoutButton(const QString& key);
     bool inFullscreen() const { return fullscreen_; }
+    void enterFullscreen() { if (!fullscreen_) toggleFullscreen(); }  // режим поста при старте
     void exitFullscreen();
 
 signals:
@@ -63,6 +68,7 @@ private:
     QWidget*     livePanel_   = nullptr;
     QWidget*     liveToolbar_ = nullptr;
     QTreeWidget* orgTree_     = nullptr;
+    QComboBox*   scaleCombo_  = nullptr;
     QLabel*      pageLbl_     = nullptr;
     QHBoxLayout* barLay_      = nullptr;
     QPushButton* editBtn_     = nullptr;

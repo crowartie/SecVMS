@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SecVMS VERSION 0.10.0 LANGUAGES CXX)
+project(SecVMS VERSION 0.12.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,7 +25,9 @@ add_executable(SecVMS WIN32
     Journal.cpp Journal.h
     Errors.cpp Errors.h
     Types.h
-    CheckStyle.h
+    CheckStyle.h Theme.h
+    Archive.cpp Archive.h
+    PlaybackView.cpp PlaybackView.h
     app.rc
 )
 

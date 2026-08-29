@@ -190,3 +190,81 @@ void XmClient::logout() {
     if (sock_.state() != QAbstractSocket::UnconnectedState)
         sock_.waitForDisconnected(500);
 }
+
+// ---- архив ----
+
+QVector<QPair<QDateTime,QDateTime>> XmClient::fileQuery(int channel0, const QDateTime& from,
+                                                        const QDateTime& to) {
+    // OPFileQuery отдаёт максимум 64 файла за запрос — листаем, сдвигая BeginTime
+    QVector<QPair<QDateTime,QDateTime>> out;
+    QDateTime cursor = from;
+    for (int guard = 0; guard < 64; ++guard) {
+        QJsonObject q;
+        q["BeginTime"]      = cursor.toString("yyyy-MM-dd HH:mm:ss");
+        q["EndTime"]        = to.toString("yyyy-MM-dd HH:mm:ss");
+        q["Channel"]        = channel0;
+        q["DriverTypeMask"] = "0x0000FFFF";
+        q["Event"]          = "*";
+        q["StreamType"]     = "0x00000000";
+        q["Type"]           = "h264";
+        QJsonObject o; o["Name"] = "OPFileQuery"; o["SessionID"] = sid_; o["OPFileQuery"] = q;
+        QByteArray resp = sendRecv(1440, QJsonDocument(o).toJson(QJsonDocument::Compact), 8000);
+        if (resp.isEmpty()) break;
+        QJsonArray arr = QJsonDocument::fromJson(resp).object().value("OPFileQuery").toArray();
+        if (arr.isEmpty()) break;
+        QDateTime last;
+        for (const auto& v : arr) {
+            QJsonObject f = v.toObject();
+            QDateTime b = QDateTime::fromString(f["BeginTime"].toString(), "yyyy-MM-dd HH:mm:ss");
+            QDateTime e = QDateTime::fromString(f["EndTime"].toString(),   "yyyy-MM-dd HH:mm:ss");
+            if (b.isValid() && e.isValid() && e > b) {
+                out.append({ b, e });
+                if (!last.isValid() || e > last) last = e;
+            }
+        }
+        if (arr.size() < 64 || !last.isValid()) break;   // последняя страница
+        cursor = last.addSecs(1);
+        if (cursor >= to) break;
+    }
+    return out;
+}
+
+bool XmClient::playClaim(int channel0, const QDateTime& from, const QDateTime& to) {
+    QJsonObject par;
+    par["FileName"]   = "";
+    par["PlayMode"]   = "ByTime";      // регистратор сам идёт по файлам, пропуская дыры
+    par["Channel"]    = channel0;
+    par["StreamType"] = 0;
+    par["TransMode"]  = "TCP";
+    par["Value"]      = 0;
+    QJsonObject pb;
+    pb["Action"]    = "Claim";
+    pb["StartTime"] = from.toString("yyyy-MM-dd HH:mm:ss");
+    pb["EndTime"]   = to.toString("yyyy-MM-dd HH:mm:ss");
+    pb["Parameter"] = par;
+    QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
+    QByteArray resp = sendRecv(1424, QJsonDocument(o).toJson(QJsonDocument::Compact), 6000);
+    int ret = QJsonDocument::fromJson(resp).object().value("Ret").toInt(-1);
+    if (ret != 100) error = QString("отказ воспроизведения (Ret=%1)").arg(ret);
+    return ret == 100;
+}
+
+void XmClient::playStart(int channel0, const QDateTime& from, const QDateTime& to) {
+    QJsonObject par;
+    par["FileName"]   = "";
+    par["PlayMode"]   = "ByTime";
+    par["Channel"]    = channel0;
+    par["StreamType"] = 0;
+    par["TransMode"]  = "TCP";
+    par["Value"]      = 0;
+    QJsonObject pb;
+    pb["Action"]    = "Start";
+    pb["StartTime"] = from.toString("yyyy-MM-dd HH:mm:ss");
+    pb["EndTime"]   = to.toString("yyyy-MM-dd HH:mm:ss");
+    pb["Parameter"] = par;
+    QJsonObject o; o["Name"] = "OPPlayBack"; o["SessionID"] = sid_; o["OPPlayBack"] = pb;
+    // ответ не ждём: сразу после Start в сокет пойдёт медиапоток
+    sock_.write(packet(1420, QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    sock_.flush();
+    ++seq_;
+}

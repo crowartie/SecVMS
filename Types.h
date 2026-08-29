@@ -24,5 +24,8 @@ struct Device {
     QString layout;            // сохранённая раскладка этого рега: "1"/"4"/"9"/"16" или "RxC"; пусто = дефолт
     QStringList customLayouts; // пользовательские сетки-кнопки ЭТОГО рега ("RxC"), не общие
     int     bufferMs = -1;     // индивидуальный буфер сглаживания, мс; -1 = брать глобальный
+    bool    rtspUdp = false;   // транспорт RTSP: false = TCP (надёжно), true = UDP
+    int     heartbeatSec = 0;  // индивидуальный период проверки, с; 0 = глобальный
+    bool    noPollOnOpen = false; // входить на вкладку без опроса (медленные реги, напр. TVT)
     QVector<CamRef> cams;
 };

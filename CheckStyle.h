@@ -4,6 +4,7 @@
 #include <QPainterPath>
 #include <QStyleOption>
 #include <QtMath>
+#include "Theme.h"
 
 // Кастомный индикатор чекбокса/таблицы: рисуем сами (QSS image: на indicator в этой
 // сборке Qt не рендерится). Пусто = белый квадрат с рамкой; включено = синяя заливка
@@ -23,10 +24,17 @@ public:
             r = r.adjusted(1, 1, -1, -1);
             p->save();
             p->setRenderHint(QPainter::Antialiasing, true);
-            QColor border = dis ? QColor("#cfd5db")
-                          : ((on || hov) ? QColor("#1f6fd6") : QColor("#8b93a0"));
-            QColor bg = on ? (dis ? QColor("#a9c4e8") : QColor("#1f6fd6"))
-                           : (dis ? QColor("#eef1f4") : QColor("#ffffff"));
+            // цвета зависят от темы (Theme::dark)
+            QColor border, bg;
+            if (Theme::dark) {
+                border = dis ? QColor("#3a424b") : ((on || hov) ? QColor("#4f8fdd") : QColor("#6a7480"));
+                bg = on ? (dis ? QColor("#35506e") : QColor("#4f8fdd"))
+                        : (dis ? QColor("#262b31") : QColor("#1e2329"));
+            } else {
+                border = dis ? QColor("#cfd5db") : ((on || hov) ? QColor("#1f6fd6") : QColor("#8b93a0"));
+                bg = on ? (dis ? QColor("#a9c4e8") : QColor("#1f6fd6"))
+                        : (dis ? QColor("#eef1f4") : QColor("#ffffff"));
+            }
             QPainterPath path; path.addRoundedRect(r, 3, 3);
             p->fillPath(path, bg);
             QPen bp(border); bp.setWidthF(1.2); p->setPen(bp); p->drawPath(path);

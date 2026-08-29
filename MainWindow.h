@@ -8,6 +8,7 @@
 
 class QTimer;
 class LiveView;
+class PlaybackView;
 class QStackedWidget;
 class QPushButton;
 class QHBoxLayout;
@@ -32,6 +33,7 @@ protected:
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;  // даблклик по шапке: развернуть/свернуть
     void closeEvent(QCloseEvent*) override;         // остановить потоки перед выходом
     void keyPressEvent(QKeyEvent*) override;        // ESC — выход из полноэкранного
     bool eventFilter(QObject*, QEvent*) override;   // показ крестика вкладки при наведении
@@ -50,6 +52,9 @@ private:
     QWidget* makeMgmt(const QString& icon, const QString& title, int page, const QString& tabTitle);
 
     void gotoPage(int page, const QString& tabTitle = QString());
+    void applyTheme();              // палитра + глобальный QSS по cfgTheme_
+    void applyKeepAwake();          // блокировка сна/гашения экрана
+    void applyHideCursor();         // автоскрытие курсора при бездействии
     void closeTab(int page);
     void setActiveTab(int page);
     void toggleMax();
@@ -80,7 +85,7 @@ private:
     void rebuildDeviceTable();
     void removeDeviceById(int id);
     void startHeartbeat();
-    void checkAllDevices();
+    void checkAllDevices(bool force = true);   // force: вне расписания per-device периодов
 
     QStackedWidget* stack_ = nullptr;
     QWidget*     topBar_ = nullptr;        // прячем в полноэкранном
@@ -88,6 +93,7 @@ private:
 
     QMap<int, LiveView*> liveViews_;       // deviceId -> вьюха
     QMap<int, int>       livePage_;        // deviceId -> индекс страницы в stack_
+    PlaybackView* playback_ = nullptr;     // страница «Воспроизведение» (архив), индекс 5
 
     QHBoxLayout* tabsRow_ = nullptr;
     QMap<int, QPushButton*> tabBtn_;   // page -> кнопка-заголовок вкладки
@@ -114,6 +120,7 @@ private:
     QVector<Device> devices_;
     QWidget* customGridsHost_ = nullptr;   // контейнер списка сеток в настройках (для live-обновления)
     QWidget*   bufferPerRegHost_ = nullptr; // контейнер инд. буферов по регам (перестраиваемый)
+    QWidget*   connPerRegHost_ = nullptr;   // контейнер per-device подключения (RTSP/опрос)
     QComboBox* autoOpenCombo_ = nullptr;    // «Сразу открывать просмотр» (перестраиваемый)
     bool     cfgHwDecode_ = false;  // settings.hwdecode из config.json
     QStringList cfgLayouts_;        // settings.layouts ("4x5", ...)
@@ -127,25 +134,35 @@ private:
     int      cfgOpenAllMaxCells_ = 16;    // иначе — максимальная сетка (4/9/16/25/36), с пагинацией
     bool     cfgShowTitles_      = true;  // подписи камер в ячейках
     bool     cfgRestoreSession_  = false; // восстанавливать сессию при запуске
+    QString  cfgTheme_ = "light";        // тема интерфейса: "light" | "dark"
+    bool     cfgKeepAwake_    = false;   // не давать ПК спать/гасить экран
+    bool     cfgWatchdog_     = false;   // перезапуск приложения при сбое
+    bool     cfgEncryptPass_  = false;   // шифровать пароли устройств (DPAPI)
+    bool     cfgConfirmExit_  = false;   // подтверждать выход из приложения
+    bool     cfgConfirmCloseAll_ = false; // подтверждать «закрыть все камеры»
+    int      cfgPollTimeoutSec_  = 6;    // таймаут опроса регистратора, с
     QStringList cfgSessionOpen_;          // IP регистраторов с открытыми вкладками (для восстановления)
     QString  cfgSessionActive_;           // IP активной вкладки
     // ip -> {раскладка стены, каналы по слотам}: какие камеры были выведены
     QMap<QString, QPair<QString, QVector<int>>> cfgSessionShown_;
     bool     cfgWindowMax_       = false; // окно было развёрнуто
-    int      cfgAutoOpenDev_     = -1;    // id устройства для автооткрытия просмотра (-1 = нет)
+    QString  cfgAutoOpenIp_;              // IP устройства для автооткрытия просмотра (пусто = нет)
     bool     cfgStartFullscreen_ = false; // полноэкранный режим при запуске
     bool     cfgHideCursor_      = false; // скрывать курсор при бездействии
-    QString  cfgAdminPass_;               // пароль на Устройства/Настройки (пусто = выкл)
+    QString  cfgAdminPass_;               // SHA-256 пароля на Устройства/Настройки (пусто = выкл)
     int      cfgConnTimeoutSec_  = 5;     // таймаут подключения к потоку, с
-    QString  cfgSnapshotDir_;             // папка снимков/записей
-    bool     cfgAudioEnabled_    = false; // звук на развёрнутой камере
-    int      cfgAudioVolume_     = 80;    // громкость, %
     bool     cfgLogEnabled_      = false; // журнал работы в файл
     // самообучающаяся база: модель -> {протокол, порт} (пополняется кнопкой «Определить»)
     QMap<QString, QPair<QString,int>> cfgKnownModels_;
     int      nextId_ = 1;
     int      editingId_ = -1;       // -1 = режим добавления, иначе id редактируемого
     QTimer*  heartbeat_ = nullptr;
+    QMap<int, qint64> hbLast_;        // id -> время последней проверки (per-device период)
+    bool     adminUnlocked_ = false;  // пароль администратора введён в этой сессии
+    bool     pendingStartFullscreen_ = false;  // войти в полноэкранный при первом просмотре
+    QTimer*  cursorTimer_ = nullptr;  // автоскрытие курсора
+    bool     cursorHidden_ = false;
+    bool     cursorWatch_ = false;    // фильтр событий активности установлен
 
     QPoint dragPos_;
     bool   dragging_ = false;
