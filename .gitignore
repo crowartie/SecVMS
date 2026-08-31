@@ -21,3 +21,6 @@ cameras.json
 *.user
 Thumbs.db
 .DS_Store
+
+# installer build output
+/installer/Output/
