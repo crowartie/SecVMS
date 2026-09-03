@@ -10,6 +10,7 @@
 #include <QRegularExpression>
 #include <QUrl>
 #include <QList>
+#include <QPair>
 #include <QSet>
 #include <algorithm>
 
@@ -158,10 +159,22 @@ DirectResult resolveCameraDirect(const CamRef& cam, const QString& fbUser,
     DirectResult r; r.channel = cam.channel;
     if (cam.ip.isEmpty()) return r;
     if (!tcpAlive(cam.ip, 554, 1500) && !tcpAlive(cam.ip, 80, 1200)) return r;   // камера не досягаема с этого ПК
-    // учётка: то, что знает регистратор; иначе — запасная из настроек
-    const QString user = cam.camUser.isEmpty() ? fbUser : cam.camUser;
-    const QString pass = cam.camUser.isEmpty() ? fbPass : cam.camPass;
     const QString hint = cam.camProto.toLower();
+
+    // Кандидаты учёток (по порядку). Регистраторы Dahua отдают ЛОГИН камеры, а пароль —
+    // замаскированным (у нас он пуст), поэтому логин из регистратора надо сочетать с
+    // запасным паролем из настроек, а не пробовать «логин + пустой пароль».
+    QList<QPair<QString,QString>> creds;
+    auto addCred = [&](const QString& u, const QString& p){
+        if (u.isEmpty() || p.isEmpty()) return;
+        for (const auto& c : creds) if (c.first == u && c.second == p) return;
+        creds.append({ u, p });
+    };
+    addCred(cam.camUser, cam.camPass);   // полная учётка от регистратора (XM/иногда TVT)
+    addCred(cam.camUser, fbPass);        // логин от регистратора + запасной пароль (Dahua)
+    addCred(fbUser, fbPass);             // запасная учётка целиком
+    if (creds.isEmpty()) addCred(cam.camUser.isEmpty() ? fbUser : cam.camUser, QString());  // без пароля — не пробуем
+    if (creds.isEmpty()) return r;
 
     // 1) ONVIF: камера сама отдаёт точные URL. Порты: сообщённый регистратором (если это
     //    не чисто RTSP/вендорный порт), затем типичные ONVIF-порты.
@@ -169,36 +182,42 @@ DirectResult resolveCameraDirect(const CamRef& cam, const QString& fbUser,
     if (cam.camPort > 0 && cam.camPort != 554 && cam.camPort != 34567 &&
         cam.camPort != 37777 && cam.camPort != 8000) ports << cam.camPort;
     for (int p : { 80, 8899, 8080, 2020 }) if (!ports.contains(p)) ports << p;
-    for (int port : ports) {
-        auto profs = onvifProfiles(cam.ip, port, user, pass, timeoutMs);
-        if (profs.isEmpty()) continue;
-        std::sort(profs.begin(), profs.end(),
-                  [](const OnvifProfile& a, const OnvifProfile& b){ return a.area > b.area; });
-        const QString mainUri = withCreds(onvifStreamUri(cam.ip, port, user, pass, profs.first().token, timeoutMs),
-                                          cam.ip, user, pass);
-        if (mainUri.isEmpty()) continue;
-        QString subUri = mainUri;
-        if (profs.size() >= 2 && profs.last().token != profs.first().token) {
-            const QString s = withCreds(onvifStreamUri(cam.ip, port, user, pass, profs.last().token, timeoutMs),
-                                        cam.ip, user, pass);
-            if (!s.isEmpty()) subUri = s;
+    for (const auto& cr : creds) {
+        const QString& user = cr.first; const QString& pass = cr.second;
+        for (int port : ports) {
+            auto profs = onvifProfiles(cam.ip, port, user, pass, timeoutMs);
+            if (profs.isEmpty()) continue;
+            std::sort(profs.begin(), profs.end(),
+                      [](const OnvifProfile& a, const OnvifProfile& b){ return a.area > b.area; });
+            const QString mainUri = withCreds(onvifStreamUri(cam.ip, port, user, pass, profs.first().token, timeoutMs),
+                                              cam.ip, user, pass);
+            if (mainUri.isEmpty()) continue;
+            QString subUri = mainUri;
+            if (profs.size() >= 2 && profs.last().token != profs.first().token) {
+                const QString s = withCreds(onvifStreamUri(cam.ip, port, user, pass, profs.last().token, timeoutMs),
+                                            cam.ip, user, pass);
+                if (!s.isEmpty()) subUri = s;
+            }
+            r.main = mainUri; r.sub = subUri; r.how = "onvif";
+            return r;
         }
-        r.main = mainUri; r.sub = subUri; r.how = "onvif";
-        return r;
     }
 
     // 2) шаблоны по подсказке протокола регистратора, каждый — с реальной проверкой
     QStringList order;
-    if      (hint.contains("dahua") || hint.contains("dh") || hint.contains("private2")) order = { "dahua", "hik", "xm" };
-    else if (hint.contains("hik") || hint.contains("isapi"))                                order = { "hik", "dahua", "xm" };
-    else if (hint.contains("netip") || hint.contains("xm") || hint.contains("xiongmai"))     order = { "xm", "dahua", "hik" };
-    else                                                                                     order = { "dahua", "hik", "xm" };
-    for (const QString& t : order) {
-        QString main, sub;
-        if      (t == "dahua") { main = tplDahua(cam.ip, user, pass, false); sub = tplDahua(cam.ip, user, pass, true); }
-        else if (t == "hik")   { main = tplHik(cam.ip, user, pass, false);   sub = tplHik(cam.ip, user, pass, true); }
-        else                   { main = tplXm(cam.ip, user, pass, false);    sub = tplXm(cam.ip, user, pass, true); }
-        if (rtspProbe(sub, timeoutMs + 1500)) { r.main = main; r.sub = sub; r.how = t; return r; }
+    if      (hint.contains("dahua") || hint.contains("dh") || hint.contains("private")) order = { "dahua", "hik", "xm" };
+    else if (hint.contains("hik") || hint.contains("isapi"))                               order = { "hik", "dahua", "xm" };
+    else if (hint.contains("netip") || hint.contains("xm") || hint.contains("xiongmai"))    order = { "xm", "dahua", "hik" };
+    else                                                                                    order = { "dahua", "hik", "xm" };
+    for (const auto& cr : creds) {
+        const QString& user = cr.first; const QString& pass = cr.second;
+        for (const QString& t : order) {
+            QString main, sub;
+            if      (t == "dahua") { main = tplDahua(cam.ip, user, pass, false); sub = tplDahua(cam.ip, user, pass, true); }
+            else if (t == "hik")   { main = tplHik(cam.ip, user, pass, false);   sub = tplHik(cam.ip, user, pass, true); }
+            else                   { main = tplXm(cam.ip, user, pass, false);    sub = tplXm(cam.ip, user, pass, true); }
+            if (rtspProbe(sub, timeoutMs + 1500)) { r.main = main; r.sub = sub; r.how = t; return r; }
+        }
     }
     return r;   // не удалось — останется через регистратор
 }
