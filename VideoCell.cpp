@@ -441,6 +441,7 @@ void VideoCell::paintEvent(QPaintEvent*) {
         QString info = type;
         if (!f.isNull() && kbps_ > 0)
             info += QString("(%1kbps, %2*%3)").arg(kbps_).arg(f.width()).arg(f.height());
+        if (!source_.isEmpty()) info += QStringLiteral(" · ") + source_;   // напрямую / через рег
         p.setPen(QColor("#d8dde3"));
         QFontMetrics fm(font());
         p.drawText(QRect(8, 0, width() - 36, hh), Qt::AlignVCenter | Qt::AlignLeft,

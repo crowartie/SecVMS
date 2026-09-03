@@ -328,6 +328,14 @@ QVector<CamInfo> LiveView::camInfos() const {
         ci.main = streamUrl(dev_, c.channel, true);
         ci.status = c.status;   // состояние по данным регистратора
         ci.udp    = dev_.rtspUdp;   // транспорт RTSP устройства
+        // ПРЯМОЕ подключение: если включено и адреса камеры известны — прямые URL,
+        // а ретрансляция регистратора остаётся запасом для автоотката
+        if (dev_.directCams && !c.directSub.isEmpty()) {
+            ci.direct = true;
+            ci.fbSub  = ci.sub;  ci.fbMain = ci.main;
+            ci.sub    = c.directSub;
+            ci.main   = c.directMain.isEmpty() ? c.directSub : c.directMain;
+        }
         cams << ci;
     }
     return cams;
@@ -351,12 +359,14 @@ void LiveView::updateDevice(const Device& dev) {
         dev.user != dev_.user || dev.pass != dev_.pass ||
         dev.rtspUdp != dev_.rtspUdp ||        // смена транспорта = перезапуск потоков
         dev.cams.size() != dev_.cams.size();
-    bool meta = false;
-    if (!structural)
+    bool meta = (dev.directCams != dev_.directCams);   // вкл/выкл прямого режима = смена URL
+    if (!structural && !meta)
         for (int i = 0; i < dev.cams.size(); ++i)
-            if (dev.cams[i].status != dev_.cams[i].status ||
-                dev.cams[i].name   != dev_.cams[i].name   ||
-                dev.cams[i].ip     != dev_.cams[i].ip) { meta = true; break; }
+            if (dev.cams[i].status     != dev_.cams[i].status     ||
+                dev.cams[i].name       != dev_.cams[i].name       ||
+                dev.cams[i].ip         != dev_.cams[i].ip         ||
+                dev.cams[i].directSub  != dev_.cams[i].directSub  ||
+                dev.cams[i].directMain != dev_.cams[i].directMain) { meta = true; break; }
     dev_ = dev;
     if (structural)      applyDevice();
     else if (meta)     { wall_->refreshMeta(camInfos()); populateOrgTree(); }

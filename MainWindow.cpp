@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "LiveView.h"
 #include "PlaybackView.h"
+#include "CamResolver.h"
 #include "XmClient.h"
 #include "DahuaUtil.h"
 #include "Discovery.h"
@@ -242,7 +243,10 @@ static QVector<CamRef> fetchDeviceCameras(const Device& d, int timeoutMs = 6000)
                 name = c.titles[cam.channel - 1].trimmed();          // запасной вариант: OSD-имя
             if (name.isEmpty()) name = QString("Камера %1").arg(cam.channel);
             int status = c.chnStatus.value(cam.channel, -1);         // -1 если регистратор не отдал
-            cams.append({ name, cam.channel, cam.ip, status });
+            CamRef cr; cr.name = name; cr.channel = cam.channel; cr.ip = cam.ip; cr.status = status;
+            cr.camUser = cam.user; cr.camPass = cam.pass;            // регистратор знает учётку камеры
+            cr.camPort = cam.port; cr.camProto = cam.proto;           // и её протокол/порт
+            cams.append(cr);
         }
     }
     return cams;
@@ -281,6 +285,11 @@ static QVector<CamRef> tvtLapiChannels(const QString& ip, const QString& user, c
         c.ip      = addr;
         c.status  = (o.value("Status").toInt() == 1) ? 1 : 0;   // онлайн/офлайн от регистратора
         if (c.name.isEmpty()) c.name = QString("Камера %1").arg(c.channel);
+        c.camPort  = o.value("AddressInfo").toObject().value("Port").toInt();
+        c.camUser  = o.value("UserName").toString();
+        c.camPass  = o.value("Password").toString();
+        c.camProto = o.value("Protocol").toString();
+        if (c.camProto.isEmpty()) c.camProto = o.value("ProtocolType").toString();
         out.append(c);
     }
     return out;
@@ -1225,6 +1234,22 @@ QWidget* MainWindow::buildSettings() {
         }
     }
 
+    // ===== Прямое подключение к камерам =====
+    {
+        auto* v = card(QStringLiteral("Прямое подключение к камерам"));
+        auto* hint = new QLabel(QStringLiteral(
+            "Регистратор остаётся справочником (имена, IP, учётки камер), а видео идёт "
+            "напрямую с каждой камеры — регистратор не захлёбывается раздачей. "
+            "Камеры должны быть доступны с этого ПК. Если камера напрямую не открылась — "
+            "автоматически через регистратор."));
+        hint->setObjectName("fieldLbl"); hint->setWordWrap(true);
+        v->addWidget(hint);
+        directHost_ = new QWidget;   // наполняет rebuildSettingsDeviceLists()
+        auto* dl = new QVBoxLayout(directHost_);
+        dl->setContentsMargins(0, 0, 0, 0); dl->setSpacing(6);
+        v->addWidget(directHost_);
+    }
+
     // ===== Интерфейс =====
     {
         auto* v = card(QStringLiteral("Интерфейс"));
@@ -1398,6 +1423,62 @@ void MainWindow::rebuildSettingsDeviceLists() {
             autoOpenCombo_->addItem(d.name.isEmpty() ? d.ip : d.name, d.ip);
         int i = autoOpenCombo_->findData(cfgAutoOpenIp_);
         autoOpenCombo_->setCurrentIndex(i < 0 ? 0 : i);
+    }
+    if (directHost_) {   // прямое подключение: вкл + запасная учётка камер + переопределить
+        auto* lay = qobject_cast<QVBoxLayout*>(directHost_->layout());
+        QLayoutItem* it;
+        while ((it = lay->takeAt(0)) != nullptr) {
+            if (it->widget()) it->widget()->deleteLater();
+            delete it;
+        }
+        for (const auto& d : devices_) {
+            int devId = d.id;
+            int known = 0;
+            for (const auto& c : d.cams) if (!c.directSub.isEmpty()) ++known;
+            auto* box = new QWidget;
+            auto* bl = new QVBoxLayout(box); bl->setContentsMargins(0,0,0,0); bl->setSpacing(3);
+            auto* r1 = new QHBoxLayout; r1->setSpacing(8);
+            auto* on = new QCheckBox(QStringLiteral("%1 — напрямую с камер")
+                                        .arg(d.name.isEmpty() ? d.ip : d.name));
+            on->setChecked(d.directCams);
+            r1->addWidget(on); r1->addStretch();
+            auto* st = new QLabel(QStringLiteral("адресов: %1/%2").arg(known).arg(d.cams.size()));
+            st->setObjectName("fieldLbl");
+            r1->addWidget(st);
+            bl->addLayout(r1);
+            auto* r2 = new QHBoxLayout; r2->setSpacing(6); r2->setContentsMargins(22,0,0,0);
+            r2->addWidget(new QLabel(QStringLiteral("Учётка камер:")));
+            auto* cu = new QLineEdit(d.camUser); cu->setPlaceholderText(QStringLiteral("логин")); cu->setFixedWidth(90);
+            auto* cp = new QLineEdit(d.camPass); cp->setPlaceholderText(QStringLiteral("пароль")); cp->setFixedWidth(100);
+            cp->setEchoMode(QLineEdit::Password);
+            cu->setToolTip(QStringLiteral("Запасная учётка, если регистратор не отдаёт пароль камер (XM отдаёт сам)"));
+            auto* det = new QPushButton(QStringLiteral("Определить адреса")); det->setObjectName("tool");
+            det->setToolTip(QStringLiteral("Заново опросить камеры (ONVIF/шаблоны) и обновить кэш адресов"));
+            r2->addWidget(cu); r2->addWidget(cp); r2->addWidget(det); r2->addStretch();
+            bl->addLayout(r2);
+            lay->addWidget(box);
+            connect(cu, &QLineEdit::editingFinished, this, [this, devId, cu]{
+                for (auto& dv : devices_) if (dv.id == devId) { dv.camUser = cu->text(); break; }
+                saveConfig();
+            });
+            connect(cp, &QLineEdit::editingFinished, this, [this, devId, cp]{
+                for (auto& dv : devices_) if (dv.id == devId) { dv.camPass = cp->text(); break; }
+                saveConfig();
+            });
+            connect(on, &QCheckBox::toggled, this, [this, devId](bool en){
+                for (auto& dv : devices_) if (dv.id == devId) {
+                    dv.directCams = en; saveConfig();
+                    if (en) resolveDirectFor(devId, false);       // недостающие адреса — фоном
+                    else if (liveViews_.contains(devId)) liveViews_[devId]->updateDevice(dv);  // назад на рег
+                    break;
+                }
+            });
+            connect(det, &QPushButton::clicked, this, [this, devId, det]{
+                det->setEnabled(false); det->setText(QStringLiteral("Опрос..."));
+                resolveDirectFor(devId, true, nullptr, [det]{
+                    det->setEnabled(true); det->setText(QStringLiteral("Определить адреса")); });
+            });
+        }
     }
     if (connPerRegHost_) {   // подключение по регистраторам: транспорт/период/тихий вход
         auto* lay = qobject_cast<QVBoxLayout*>(connPerRegHost_->layout());
@@ -1720,16 +1801,50 @@ void MainWindow::openDeviceView(int devId) {
         Device* d = nullptr;
         for (auto& e : devices_) if (e.id == devId) { d = &e; break; }
         if (!d) return;
-        if (!cams.isEmpty()) { d->cams = cams; saveConfig(); }
-
-        if (liveViews_.contains(devId)) {                 // вьюха была закрыта — обновить и открыть
-            liveViews_[devId]->updateDevice(*d);
-            gotoPage(livePage_[devId], tabTitle);
-            return;
+        if (!cams.isEmpty()) {
+            // перенести кэш прямых адресов/учёток из прежнего списка (по каналу и IP)
+            for (auto& nc : cams)
+                for (const auto& oc : d->cams)
+                    if (oc.channel == nc.channel && oc.ip == nc.ip) {
+                        nc.directMain = oc.directMain; nc.directSub = oc.directSub; nc.directHow = oc.directHow;
+                        if (nc.camUser.isEmpty()) { nc.camUser = oc.camUser; nc.camPass = oc.camPass; }
+                        if (nc.camPort == 0)       nc.camPort = oc.camPort;
+                        if (nc.camProto.isEmpty()) nc.camProto = oc.camProto;
+                        break;
+                    }
+            d->cams = cams; saveConfig();
         }
-        int page = createDeviceView(*d);
-        gotoPage(page, tabTitle);
-        saveSession();
+
+        auto openIt = [this, devId, tabTitle]{
+            Device* dd = nullptr;
+            for (auto& e : devices_) if (e.id == devId) { dd = &e; break; }
+            if (!dd) return;
+            if (liveViews_.contains(devId)) {             // вьюха была закрыта — обновить и открыть
+                liveViews_[devId]->updateDevice(*dd);
+                gotoPage(livePage_[devId], tabTitle);
+                return;
+            }
+            int page = createDeviceView(*dd);
+            gotoPage(page, tabTitle);
+            saveSession();
+        };
+        // прямой режим: камерам без известных адресов — определить (один раз, далее кэш)
+        bool need = false;
+        if (d->directCams && !directTriedRun_.contains(devId))   // авто-поиск адресов — раз за запуск
+            for (const auto& c : d->cams)
+                if (c.directSub.isEmpty() && c.status != 0 && !c.ip.isEmpty()) { need = true; break; }
+        if (need) {
+            auto* dlg = new QDialog(this);
+            dlg->setObjectName("addpanel"); dlg->setModal(true);
+            dlg->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+            dlg->setAttribute(Qt::WA_StyledBackground); dlg->setFixedSize(340, 120);
+            auto* lv2 = new QVBoxLayout(dlg); lv2->setContentsMargins(24,20,24,20);
+            auto* lbl = new QLabel(QStringLiteral("Определение адресов камер..."));
+            lbl->setAlignment(Qt::AlignCenter); lbl->setWordWrap(true);
+            lv2->addStretch(); lv2->addWidget(lbl); lv2->addStretch();
+            dlg->move(geometry().center() - QPoint(170, 60)); dlg->show();
+            resolveDirectFor(devId, false, lbl, [dlg, openIt]{ dlg->close(); dlg->deleteLater(); openIt(); });
+        } else openIt();
     });
     const int pollMs = cfgPollTimeoutSec_ * 1000;
     w->setFuture(QtConcurrent::run([dcopy, pollMs]{ return fetchDeviceCameras(dcopy, pollMs); }));
@@ -1786,6 +1901,56 @@ void MainWindow::applyBufferToViews() {
 
 void MainWindow::applyOpenAllMode() {
     for (auto* v : liveViews_) v->setOpenAllMode(cfgOpenAllAuto_, cfgOpenAllMaxCells_);
+}
+
+// Фоновое определение прямых RTSP-адресов камер регистратора. Результаты — в конфиг
+// (кэш), затем then(); открытая вьюха переключается на прямые URL бесшовно (updateDevice).
+void MainWindow::resolveDirectFor(int devId, bool force, QLabel* progressLbl,
+                                  std::function<void()> then) {
+    Device* d = nullptr;
+    for (auto& e : devices_) if (e.id == devId) { d = &e; break; }
+    if (!d) { if (then) then(); return; }
+    directTriedRun_.insert(devId);
+    QVector<CamRef> todo;
+    for (const auto& c : d->cams)
+        if (!c.ip.isEmpty() && c.status != 0 && (force || c.directSub.isEmpty())) todo.append(c);
+    if (todo.isEmpty()) { if (then) then(); return; }
+    const QString fbUser = d->camUser, fbPass = d->camPass;
+    const int total = todo.size();
+    auto* pool = new QThreadPool(this); pool->setMaxThreadCount(6);   // не штурмовать LAN
+    auto* w = new QFutureWatcher<DirectResult>(this);
+    connect(w, &QFutureWatcher<DirectResult>::progressValueChanged, this,
+            [progressLbl, total](int done){
+        if (progressLbl) progressLbl->setText(
+            QStringLiteral("Определение адресов камер: %1 из %2").arg(done).arg(total));
+    });
+    connect(w, &QFutureWatcher<DirectResult>::finished, this, [this, w, pool, devId, then]{
+        int ok = 0;
+        Device* dd = nullptr;
+        for (auto& e : devices_) if (e.id == devId) { dd = &e; break; }
+        if (dd) {
+            const int cnt = w->future().resultCount();
+            for (int i = 0; i < cnt; ++i) {
+                const DirectResult r = w->resultAt(i);
+                for (auto& c : dd->cams)
+                    if (c.channel == r.channel) {
+                        c.directMain = r.main; c.directSub = r.sub; c.directHow = r.how;
+                        if (!r.sub.isEmpty()) ++ok;
+                        break;
+                    }
+            }
+            saveConfig();
+            if (liveViews_.contains(devId)) liveViews_[devId]->updateDevice(*dd);  // бесшовно на прямые
+            Journal::inst().info(dd->name.isEmpty() ? dd->ip : dd->name,
+                QStringLiteral("Прямые адреса камер: определено %1 из %2").arg(ok).arg(cnt));
+        }
+        w->deleteLater(); pool->deleteLater();
+        rebuildSettingsDeviceLists();
+        if (then) then();
+    });
+    w->setFuture(QtConcurrent::mapped(pool, todo, [fbUser, fbPass](const CamRef& c){
+        return resolveCameraDirect(c, fbUser, fbPass, 2500);
+    }));
 }
 
 void MainWindow::rebuildCustomGrids() {
@@ -2285,10 +2450,18 @@ void MainWindow::saveConfig() {
         o["rtspUdp"] = d.rtspUdp;
         o["heartbeatSec"] = d.heartbeatSec;   // 0 = глобальный период
         o["noPollOnOpen"] = d.noPollOnOpen;
+        o["directCams"] = d.directCams;
+        o["camUser"] = d.camUser;
+        if (cfgEncryptPass_) o["camPassEnc"] = encPass(d.camPass); else o["camPass"] = d.camPass;
         QJsonArray cams;
         for (const auto& c : d.cams) {
             QJsonObject co;
             co["channel"] = c.channel; co["name"] = c.name; co["ip"] = c.ip;
+            if (!c.camUser.isEmpty())    co["camUser"] = c.camUser;
+            if (!c.camPass.isEmpty()) { if (cfgEncryptPass_) co["camPassEnc"] = encPass(c.camPass); else co["camPass"] = c.camPass; }
+            if (c.camPort)               co["camPort"] = c.camPort;
+            if (!c.camProto.isEmpty())   co["camProto"] = c.camProto;
+            if (!c.directSub.isEmpty())  { co["directSub"] = c.directSub; co["directMain"] = c.directMain; co["directHow"] = c.directHow; }
             cams.append(co);
         }
         o["cameras"] = cams;
@@ -2385,9 +2558,18 @@ void MainWindow::loadConfig() {
             d.rtspUdp      = o["rtspUdp"].toBool(false);
             d.heartbeatSec = o["heartbeatSec"].toInt(0);
             d.noPollOnOpen = o["noPollOnOpen"].toBool(false);
+            d.directCams = o["directCams"].toBool(false);
+            d.camUser = o["camUser"].toString();
+            d.camPass = o.contains("camPassEnc") ? decPass(o["camPassEnc"].toString()) : o["camPass"].toString();
             for (const auto& cv : o["cameras"].toArray()) {
                 QJsonObject co = cv.toObject();
-                d.cams.append({ co["name"].toString(), co["channel"].toInt(), co["ip"].toString() });
+                CamRef cr; cr.name = co["name"].toString(); cr.channel = co["channel"].toInt(); cr.ip = co["ip"].toString();
+                cr.camUser = co["camUser"].toString();
+                cr.camPass = co.contains("camPassEnc") ? decPass(co["camPassEnc"].toString()) : co["camPass"].toString();
+                cr.camPort = co["camPort"].toInt(); cr.camProto = co["camProto"].toString();
+                cr.directSub = co["directSub"].toString(); cr.directMain = co["directMain"].toString();
+                cr.directHow = co["directHow"].toString();
+                d.cams.append(cr);
             }
             devices_.append(d);
         }

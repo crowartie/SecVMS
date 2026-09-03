@@ -12,7 +12,10 @@ class QDragEnterEvent;
 class QDropEvent;
 
 struct CamInfo { QString name, sub, main; int status = -1;    // status: 1 онлайн, 0 офлайн, -1 неизв.
-                 bool udp = false; };                          // транспорт RTSP устройства
+                 bool udp = false;                             // транспорт RTSP устройства
+                 bool direct = false;                          // sub/main — прямые URL камеры
+                 QString fbSub, fbMain;                        // запас: через регистратор (для отката)
+                 bool usingFallback = false; };                // прямой не открылся — играем через рег
 
 // Видеостена: ЖЁСТКАЯ сетка слотов (1/4/9/16), камеры раскладываются по слотам.
 // Стартует пустой: камеры появляются после перетаскивания регистратора/камеры

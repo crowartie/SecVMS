@@ -22,6 +22,7 @@
 #include <algorithm>
 
 static const char* kCamMime = "application/x-secvms-cam";
+static QString sourceLabel(const CamInfo& c);   // подпись источника потока (определена ниже)
 
 VideoWall::VideoWall(QWidget* parent)
     : QWidget(parent)
@@ -57,6 +58,7 @@ void VideoWall::setCameras(const QVector<CamInfo>& cams) {
         c->setBuffer(bufMs_);
         c->setConnTimeout(connMs_);
         c->setUdp(cams_[i].udp);
+        c->setSource(sourceLabel(cams_[i]));
         if (cams_[i].status == 0) c->setOffline(true);   // офлайн по данным регистратора
         connect(c, &VideoCell::doubleClicked,  this, &VideoWall::onCellDouble);
         connect(c, &VideoCell::clicked,        this, &VideoWall::onCellClicked);
@@ -83,6 +85,7 @@ void VideoWall::refreshMeta(const QVector<CamInfo>& cams) {
         cams_[i] = cams[i];
         cells_[i]->setTitle(cams_[i].name);
         cells_[i]->setUdp(cams_[i].udp);
+        cells_[i]->setSource(sourceLabel(cams_[i]));
         cells_[i]->setOffline(cams_[i].status == 0);   // офлайн: стоп+«недоступна»; онлайн: снять флаг
     }
     if (active_ && populated_) applyStreams();   // снова онлайн — до-запустить, офлайн уже остановлены
@@ -96,8 +99,18 @@ QStringList VideoWall::cameraNames() const {
 
 QString VideoWall::streamUrlFor(int i, bool big) const {
     const CamInfo& c = cams_[i];
-    if (big || useMain_) return c.main.isEmpty() ? c.sub : c.main;  // основной поток
-    return c.sub.isEmpty() ? c.main : c.sub;                        // субпоток
+    // прямой поток не открылся -> запасные URL через регистратор
+    const bool fb = c.usingFallback && !c.fbSub.isEmpty();
+    const QString& main = fb ? c.fbMain : c.main;
+    const QString& sub  = fb ? c.fbSub  : c.sub;
+    if (big || useMain_) return main.isEmpty() ? sub : main;   // основной поток
+    return sub.isEmpty() ? main : sub;                          // субпоток
+}
+
+static QString sourceLabel(const CamInfo& c) {
+    if (!c.direct) return QStringLiteral("через регистратор");
+    return c.usingFallback ? QStringLiteral("через регистратор (откат)")
+                           : QStringLiteral("напрямую с камеры");
 }
 
 int VideoWall::pageCount() const {
@@ -345,7 +358,19 @@ void VideoWall::onCellClicked(VideoCell* c) {
 
 void VideoWall::onCellStatus(VideoCell* c) {
     int idx = cells_.indexOf(c);
-    if (idx >= 0) emit cameraStatusChanged(idx, c->status());
+    if (idx < 0) return;
+    // ПРЯМОЙ поток не открылся (2 неудачи подряд) — автооткат на регистратор для этой ячейки
+    if (c->status() == VideoCell::Failed && cams_[idx].direct && !cams_[idx].usingFallback &&
+        !cams_[idx].fbSub.isEmpty() && cams_[idx].status != 0) {
+        cams_[idx].usingFallback = true;
+        c->setSource(sourceLabel(cams_[idx]));
+        QTimer::singleShot(0, this, [this, c]{        // вне сигнала статуса: стоп + перезапуск
+            if (!cells_.contains(c)) return;
+            c->stop();
+            applyStreams();
+        });
+    }
+    emit cameraStatusChanged(idx, c->status());
 }
 
 void VideoWall::onCellClose(VideoCell* c) {

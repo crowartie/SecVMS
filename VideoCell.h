@@ -58,6 +58,7 @@ public:
 
     void setTitle(const QString& name) { title_ = name; update(); }
     void setShowTitle(bool on) { showTitle_ = on; update(); }  // подпись камеры в ячейке
+    void setSource(const QString& s) { source_ = s; update(); } // «напрямую» / «через регистратор» (в hover-шапке)
     void setStretch(bool on) { stretch_ = on; update(); }
     void setBuffer(int ms);   // буфер сглаживания (мс): в текущие и новые декодеры
     void setConnTimeout(int ms);   // таймаут подключения к потоку (мс)
@@ -103,7 +104,7 @@ private:
     bool     pendHw_ = false;
     QImage  frame_;
     QMutex  mtx_;
-    QString url_, title_;
+    QString url_, title_, source_;
     bool    playing_ = false;
     bool    hw_ = false;
     bool    udp_ = false;       // транспорт RTSP (для новых декодеров)

@@ -3,8 +3,10 @@
 #include <QPoint>
 #include <QMap>
 #include <QVector>
+#include <QSet>
 #include "Types.h"
 #include "Journal.h"
+#include <functional>
 
 class QTimer;
 class LiveView;
@@ -68,6 +70,9 @@ private:
     void applyOpenAllMode();        // разослать режим «Открыть все» во все вьюхи
     void rebuildCustomGrids();      // перезаполнить карточку «Пользовательские сетки»
     void rebuildSettingsDeviceLists();  // списки регов в настройках (буферы, автооткрытие)
+    // определить прямые RTSP-адреса камер рега (фоново); force = заново для всех камер
+    void resolveDirectFor(int devId, bool force, QLabel* progressLbl = nullptr,
+                          std::function<void()> then = {});
     void saveSession();             // запомнить открытые вкладки/активную/раскладки
     void restoreSession();          // восстановить вкладки при запуске
     void openAutoSearch();          // модалка автопоиска устройств в сегменте сети
@@ -121,6 +126,8 @@ private:
     QWidget* customGridsHost_ = nullptr;   // контейнер списка сеток в настройках (для live-обновления)
     QWidget*   bufferPerRegHost_ = nullptr; // контейнер инд. буферов по регам (перестраиваемый)
     QWidget*   connPerRegHost_ = nullptr;   // контейнер per-device подключения (RTSP/опрос)
+    QWidget*   directHost_ = nullptr;       // карточка «Прямое подключение к камерам»
+    QSet<int>  directTriedRun_;             // реги, для которых адреса уже искали в этом запуске
     QComboBox* autoOpenCombo_ = nullptr;    // «Сразу открывать просмотр» (перестраиваемый)
     bool     cfgHwDecode_ = false;  // settings.hwdecode из config.json
     QStringList cfgLayouts_;        // settings.layouts ("4x5", ...)

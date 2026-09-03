@@ -28,6 +28,7 @@ add_executable(SecVMS WIN32
     CheckStyle.h Theme.h
     Archive.cpp Archive.h
     PlaybackView.cpp PlaybackView.h
+    CamResolver.cpp CamResolver.h
     app.rc
 )
 

@@ -9,6 +9,12 @@ struct CamRef {
     int     channel = 0; // номер канала на регистраторе
     QString ip;          // IP камеры (справочно)
     int     status = -1; // состояние по данным регистратора: 1=онлайн, 0=офлайн, -1=неизвестно
+    // --- данные для ПРЯМОГО подключения к камере (минуя регистратор) ---
+    QString camUser, camPass;   // учётка камеры, как её знает регистратор (XM отдаёт явно)
+    int     camPort = 0;        // управляющий порт камеры по данным регистратора
+    QString camProto;           // протокол камеры на регистраторе: ONVIF/NETIP/DAHUA/HIKVISION...
+    QString directMain, directSub;  // разрешённые прямые RTSP-URL (кэш); пусто = не определены
+    QString directHow;          // как определили: onvif / dahua / hik / xm
 };
 
 // одно сохранённое устройство (регистратор) со своими камерами
@@ -27,5 +33,7 @@ struct Device {
     bool    rtspUdp = false;   // транспорт RTSP: false = TCP (надёжно), true = UDP
     int     heartbeatSec = 0;  // индивидуальный период проверки, с; 0 = глобальный
     bool    noPollOnOpen = false; // входить на вкладку без опроса (медленные реги, напр. TVT)
+    bool    directCams = false;   // live-видео НАПРЯМУЮ с камер (регистратор — только справочник)
+    QString camUser, camPass;     // запасная учётка камер, если регистратор её не отдаёт
     QVector<CamRef> cams;
 };
