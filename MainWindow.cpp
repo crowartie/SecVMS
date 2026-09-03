@@ -1930,12 +1930,16 @@ void MainWindow::resolveDirectFor(int devId, bool force, QLabel* progressLbl,
         for (auto& e : devices_) if (e.id == devId) { dd = &e; break; }
         if (dd) {
             const int cnt = w->future().resultCount();
+            const QString src = dd->name.isEmpty() ? dd->ip : dd->name;
             for (int i = 0; i < cnt; ++i) {
                 const DirectResult r = w->resultAt(i);
                 for (auto& c : dd->cams)
                     if (c.channel == r.channel) {
                         c.directMain = r.main; c.directSub = r.sub; c.directHow = r.how;
                         if (!r.sub.isEmpty()) ++ok;
+                        else   // диагностика в Журнал: почему камера не определилась
+                            Journal::inst().warn(src, QStringLiteral("Не определён адрес: %1 (%2) — %3")
+                                .arg(c.name, c.ip, r.why));
                         break;
                     }
             }

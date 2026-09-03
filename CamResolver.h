@@ -10,7 +10,8 @@
 struct DirectResult {
     int     channel = 0;
     QString main, sub;      // прямые URL (с учёткой внутри); пусто = не удалось
-    QString how;            // onvif / dahua / hik / xm
+    QString how;            // onvif / dahua / hik / tvt / ... (имя шаблона)
+    QString why;            // если не удалось — на каком этапе и почему (для Журнала)
 };
 
 DirectResult resolveCameraDirect(const CamRef& cam, const QString& fallbackUser,

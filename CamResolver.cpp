@@ -12,6 +12,7 @@
 #include <QList>
 #include <QPair>
 #include <QSet>
+#include <QStringList>
 #include <algorithm>
 
 extern "C" {
@@ -110,17 +111,30 @@ static QString withCreds(const QString& uri, const QString& ip, const QString& u
 
 static QString enc(const QString& s) { return QString::fromLatin1(QUrl::toPercentEncoding(s)); }
 
-static QString tplDahua(const QString& ip, const QString& u, const QString& p, bool sub) {
-    return QString("rtsp://%1:%2@%3:554/cam/realmonitor?channel=1&subtype=%4")
-        .arg(enc(u), enc(p), ip).arg(sub ? 1 : 0);
+// Известные RTSP-пути IP-камер: {имя, основной, суб}. Учётка подставляется как user:pass@.
+// Xiongmai — особый (учётка в пути), см. tplXm.
+struct Tpl { const char* name; const char* main; const char* sub; };
+static const Tpl kTpls[] = {
+    { "dahua",   "/cam/realmonitor?channel=1&subtype=0", "/cam/realmonitor?channel=1&subtype=1" },
+    { "hik",     "/Streaming/Channels/101",               "/Streaming/Channels/102" },
+    { "hik-old", "/h264/ch1/main/av_stream",              "/h264/ch1/sub/av_stream" },
+    { "tvt",     "/profile1",                             "/profile2" },          // TVT / Provision-ISR
+    { "uniview", "/media/video1",                         "/media/video2" },
+    { "generic", "/live/ch00_0",                          "/live/ch00_1" },
+    { "stream",  "/stream1",                              "/stream2" },
+    { "tplink",  "/11",                                   "/12" },
+    { "onvifN",  "/onvif1",                               "/onvif2" },
+    { "foscam",  "/videoMain",                            "/videoSub" },
+    { "axis",    "/axis-media/media.amp",                 "/axis-media/media.amp?streamprofile=Quality" },
+    { "h264q",   "/H264?ch=1&subtype=0",                  "/H264?ch=1&subtype=1" },
+};
+
+static QString tplUrl(const QString& ip, int port, const QString& u, const QString& p, const char* path) {
+    return QString("rtsp://%1:%2@%3:%4%5").arg(enc(u), enc(p), ip).arg(port).arg(QString::fromLatin1(path));
 }
-static QString tplHik(const QString& ip, const QString& u, const QString& p, bool sub) {
-    return QString("rtsp://%1:%2@%3:554/Streaming/Channels/10%4")
-        .arg(enc(u), enc(p), ip).arg(sub ? 2 : 1);
-}
-static QString tplXm(const QString& ip, const QString& u, const QString& p, bool sub) {
-    return QString("rtsp://%1:554/user=%2&password=%3&channel=1&stream=%4.sdp?real_stream")
-        .arg(ip, enc(u), enc(p)).arg(sub ? 1 : 0);
+static QString tplXm(const QString& ip, int port, const QString& u, const QString& p, bool sub) {
+    return QString("rtsp://%1:%2/user=%3&password=%4&channel=1&stream=%5.sdp?real_stream")
+        .arg(ip).arg(port).arg(enc(u), enc(p)).arg(sub ? 1 : 0);
 }
 
 // Реальное открытие RTSP (DESCRIBE/SETUP) — единственная надёжная проверка пути и учётки
@@ -145,7 +159,6 @@ static bool rtspProbe(const QString& url, int timeoutMs) {
 
 // ---------------------------------------------------------------- резолвер
 
-// быстрая проверка досягаемости: RTSP-порт камеры (иначе ONVIF/шаблоны ждут таймауты зря)
 static bool tcpAlive(const QString& ip, quint16 port, int ms) {
     QTcpSocket s;
     s.connectToHost(ip, port);
@@ -157,36 +170,45 @@ static bool tcpAlive(const QString& ip, quint16 port, int ms) {
 DirectResult resolveCameraDirect(const CamRef& cam, const QString& fbUser,
                                  const QString& fbPass, int timeoutMs) {
     DirectResult r; r.channel = cam.channel;
-    if (cam.ip.isEmpty()) return r;
-    if (!tcpAlive(cam.ip, 554, 1500) && !tcpAlive(cam.ip, 80, 1200)) return r;   // камера не досягаема с этого ПК
+    if (cam.ip.isEmpty()) { r.why = QStringLiteral("регистратор не отдал IP камеры"); return r; }
     const QString hint = cam.camProto.toLower();
 
-    // Кандидаты учёток (по порядку). Регистраторы Dahua отдают ЛОГИН камеры, а пароль —
-    // замаскированным (у нас он пуст), поэтому логин из регистратора надо сочетать с
-    // запасным паролем из настроек, а не пробовать «логин + пустой пароль».
+    // 1) какие порты вообще открыты (быстро): RTSP-кандидаты и HTTP/ONVIF-кандидаты
+    QList<int> rtspPorts, httpPorts;
+    for (int p : { 554, 8554, 10554 }) if (tcpAlive(cam.ip, (quint16)p, 1200)) rtspPorts << p;
+    QList<int> httpTry = { 80, 8899, 8080, 8000, 2020, 10080, 5000, 8001 };
+    if (cam.camPort > 0 && !httpTry.contains(cam.camPort) && cam.camPort != 554 &&
+        cam.camPort != 34567 && cam.camPort != 37777) httpTry.prepend(cam.camPort);
+    for (int p : httpTry) if (tcpAlive(cam.ip, (quint16)p, 700)) httpPorts << p;
+    if (rtspPorts.isEmpty() && httpPorts.isEmpty()) {
+        r.why = QStringLiteral("недосягаема: закрыты порты RTSP 554/8554/10554 и HTTP");
+        return r;
+    }
+
+    // 2) кандидаты учёток. Dahua-NVR отдаёт логин, а пароль маскирует — сочетаем логин
+    //    регистратора с запасным паролем; пустой пароль не пробуем.
     QList<QPair<QString,QString>> creds;
     auto addCred = [&](const QString& u, const QString& p){
         if (u.isEmpty() || p.isEmpty()) return;
         for (const auto& c : creds) if (c.first == u && c.second == p) return;
         creds.append({ u, p });
     };
-    addCred(cam.camUser, cam.camPass);   // полная учётка от регистратора (XM/иногда TVT)
-    addCred(cam.camUser, fbPass);        // логин от регистратора + запасной пароль (Dahua)
-    addCred(fbUser, fbPass);             // запасная учётка целиком
-    if (creds.isEmpty()) addCred(cam.camUser.isEmpty() ? fbUser : cam.camUser, QString());  // без пароля — не пробуем
-    if (creds.isEmpty()) return r;
+    addCred(cam.camUser, cam.camPass);
+    addCred(cam.camUser, fbPass);
+    addCred(fbUser, fbPass);
+    if (creds.isEmpty()) {
+        r.why = QStringLiteral("нет учётки: регистратор пароль не отдал, запасная не задана");
+        return r;
+    }
 
-    // 1) ONVIF: камера сама отдаёт точные URL. Порты: сообщённый регистратором (если это
-    //    не чисто RTSP/вендорный порт), затем типичные ONVIF-порты.
-    QList<int> ports;
-    if (cam.camPort > 0 && cam.camPort != 554 && cam.camPort != 34567 &&
-        cam.camPort != 37777 && cam.camPort != 8000) ports << cam.camPort;
-    for (int p : { 80, 8899, 8080, 2020 }) if (!ports.contains(p)) ports << p;
+    // 3) ONVIF: камера сама отдаёт точные URL
+    bool onvifSeen = false;
     for (const auto& cr : creds) {
         const QString& user = cr.first; const QString& pass = cr.second;
-        for (int port : ports) {
+        for (int port : httpPorts) {
             auto profs = onvifProfiles(cam.ip, port, user, pass, timeoutMs);
             if (profs.isEmpty()) continue;
+            onvifSeen = true;
             std::sort(profs.begin(), profs.end(),
                       [](const OnvifProfile& a, const OnvifProfile& b){ return a.area > b.area; });
             const QString mainUri = withCreds(onvifStreamUri(cam.ip, port, user, pass, profs.first().token, timeoutMs),
@@ -198,26 +220,60 @@ DirectResult resolveCameraDirect(const CamRef& cam, const QString& fbUser,
                                             cam.ip, user, pass);
                 if (!s.isEmpty()) subUri = s;
             }
-            r.main = mainUri; r.sub = subUri; r.how = "onvif";
+            r.main = mainUri; r.sub = subUri; r.how = QString("onvif:%1").arg(port);
             return r;
         }
     }
 
-    // 2) шаблоны по подсказке протокола регистратора, каждый — с реальной проверкой
+    // 4) шаблоны — по подсказке протокола регистратора вперёд, потом все остальные;
+    //    каждый на каждом живом RTSP-порту с реальной проверкой
     QStringList order;
-    if      (hint.contains("dahua") || hint.contains("dh") || hint.contains("private")) order = { "dahua", "hik", "xm" };
-    else if (hint.contains("hik") || hint.contains("isapi"))                               order = { "hik", "dahua", "xm" };
-    else if (hint.contains("netip") || hint.contains("xm") || hint.contains("xiongmai"))    order = { "xm", "dahua", "hik" };
-    else                                                                                    order = { "dahua", "hik", "xm" };
+    auto pushFirst = [&](std::initializer_list<const char*> names){ for (auto n : names) order << n; };
+    if      (hint.contains("dahua") || hint.contains("private"))                 pushFirst({ "dahua" });
+    else if (hint.contains("hik") || hint.contains("isapi"))                     pushFirst({ "hik", "hik-old" });
+    else if (hint.contains("tvt") || hint.contains("ipc") || hint.contains("nvms")) pushFirst({ "tvt" });
+    else if (hint.contains("uni"))                                               pushFirst({ "uniview" });
+    for (const auto& t : kTpls) if (!order.contains(t.name)) order << t.name;
+    const bool xmHint = hint.contains("netip") || hint.contains("xm") || hint.contains("xiongmai");
+    QList<int> ports = rtspPorts.isEmpty() ? QList<int>{ 554 } : rtspPorts;
+    int tried = 0;
     for (const auto& cr : creds) {
         const QString& user = cr.first; const QString& pass = cr.second;
-        for (const QString& t : order) {
-            QString main, sub;
-            if      (t == "dahua") { main = tplDahua(cam.ip, user, pass, false); sub = tplDahua(cam.ip, user, pass, true); }
-            else if (t == "hik")   { main = tplHik(cam.ip, user, pass, false);   sub = tplHik(cam.ip, user, pass, true); }
-            else                   { main = tplXm(cam.ip, user, pass, false);    sub = tplXm(cam.ip, user, pass, true); }
-            if (rtspProbe(sub, timeoutMs + 1500)) { r.main = main; r.sub = sub; r.how = t; return r; }
+        for (int port : ports) {
+            if (xmHint) {   // XM IPC — сначала его формат
+                ++tried;
+                if (rtspProbe(tplXm(cam.ip, port, user, pass, true), timeoutMs + 1500)) {
+                    r.main = tplXm(cam.ip, port, user, pass, false); r.sub = tplXm(cam.ip, port, user, pass, true);
+                    r.how = "xm"; return r;
+                }
+            }
+            for (const QString& name : order) {
+                const Tpl* t = nullptr;
+                for (const auto& k : kTpls) if (name == k.name) { t = &k; break; }
+                if (!t) continue;
+                ++tried;
+                if (rtspProbe(tplUrl(cam.ip, port, user, pass, t->sub), timeoutMs + 1500)) {
+                    r.main = tplUrl(cam.ip, port, user, pass, t->main);
+                    r.sub  = tplUrl(cam.ip, port, user, pass, t->sub);
+                    r.how  = QString::fromLatin1(t->name); return r;
+                }
+            }
+            if (!xmHint) {  // XM-формат — в конце, если подсказки не было
+                ++tried;
+                if (rtspProbe(tplXm(cam.ip, port, user, pass, true), timeoutMs + 1500)) {
+                    r.main = tplXm(cam.ip, port, user, pass, false); r.sub = tplXm(cam.ip, port, user, pass, true);
+                    r.how = "xm"; return r;
+                }
+            }
         }
     }
-    return r;   // не удалось — останется через регистратор
+    QStringList rp; for (int p : rtspPorts) rp << QString::number(p);
+    QStringList hp; for (int p : httpPorts) hp << QString::number(p);
+    r.why = QStringLiteral("RTSP-порты: %1; HTTP: %2; ONVIF: %3; шаблонов проверено: %4; учёток: %5; протокол на реге: «%6»")
+                .arg(rp.isEmpty() ? QStringLiteral("нет") : rp.join('/'),
+                     hp.isEmpty() ? QStringLiteral("нет") : hp.join('/'),
+                     onvifSeen ? QStringLiteral("отвечает, но URL не дал/учётка не подошла")
+                               : QStringLiteral("не отвечает"))
+                .arg(tried).arg(creds.size()).arg(cam.camProto);
+    return r;
 }
