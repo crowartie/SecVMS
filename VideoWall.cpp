@@ -108,9 +108,11 @@ QString VideoWall::streamUrlFor(int i, bool big) const {
 }
 
 static QString sourceLabel(const CamInfo& c) {
-    if (!c.direct) return QStringLiteral("через регистратор");
-    return c.usingFallback ? QStringLiteral("через регистратор (откат)")
-                           : QStringLiteral("напрямую с камеры");
+    // подпись источника: говорим не только «откуда», но и «почему»
+    if (!c.directMode)   return QStringLiteral("через регистратор (прямой режим выкл.)");
+    if (!c.direct)       return QStringLiteral("через регистратор (адрес камеры не определён)");
+    if (c.usingFallback) return QStringLiteral("через регистратор (откат: камера напрямую не открылась)");
+    return QStringLiteral("напрямую с камеры");
 }
 
 int VideoWall::pageCount() const {

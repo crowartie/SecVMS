@@ -13,6 +13,7 @@ class QDropEvent;
 
 struct CamInfo { QString name, sub, main; int status = -1;    // status: 1 онлайн, 0 офлайн, -1 неизв.
                  bool udp = false;                             // транспорт RTSP устройства
+                 bool directMode = false;                      // у регистратора включён прямой режим
                  bool direct = false;                          // sub/main — прямые URL камеры
                  QString fbSub, fbMain;                        // запас: через регистратор (для отката)
                  bool usingFallback = false; };                // прямой не открылся — играем через рег

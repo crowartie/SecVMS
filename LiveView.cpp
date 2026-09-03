@@ -328,6 +328,7 @@ QVector<CamInfo> LiveView::camInfos() const {
         ci.main = streamUrl(dev_, c.channel, true);
         ci.status = c.status;   // состояние по данным регистратора
         ci.udp    = dev_.rtspUdp;   // транспорт RTSP устройства
+        ci.directMode = dev_.directCams;   // для подписи «почему через регистратор»
         // ПРЯМОЕ подключение: если включено и адреса камеры известны — прямые URL,
         // а ретрансляция регистратора остаётся запасом для автоотката
         if (dev_.directCams && !c.directSub.isEmpty()) {
@@ -420,8 +421,16 @@ void LiveView::populateOrgTree() {
     orgTree_->clear();
     camItems_.clear();
     auto* dev = new QTreeWidgetItem(orgTree_);
-    dev->setText(0, dev_.name.isEmpty() ? dev_.ip : dev_.name);
-    dev->setToolTip(0, dev_.ip);
+    QString rootText = dev_.name.isEmpty() ? dev_.ip : dev_.name;
+    QString tip = dev_.ip;
+    if (dev_.directCams) {            // постоянный индикатор прямого режима: сколько камер с адресами
+        int n = 0;
+        for (const auto& c : dev_.cams) if (!c.directSub.isEmpty()) ++n;
+        rootText += QStringLiteral("  [напрямую %1/%2]").arg(n).arg(dev_.cams.size());
+        tip += QStringLiteral("\nПрямой режим: адреса определены у %1 из %2 камер").arg(n).arg(dev_.cams.size());
+    } else tip += QStringLiteral("\nВидео через регистратор (прямой режим выключен в Настройках)");
+    dev->setText(0, rootText);
+    dev->setToolTip(0, tip);
     dev->setIcon(0, QIcon(lvIconPix("devices", 15)));
     dev->setData(0, Qt::UserRole, -1);
     const QStringList names = wall_->cameraNames();
